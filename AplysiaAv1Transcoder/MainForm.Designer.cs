@@ -32,6 +32,11 @@ partial class MainForm
     private GroupBox groupAuto;
     private CheckBox checkAutoMatch;
     private Label labelAutoMatch;
+    private Label labelAutoMode;
+    private ComboBox comboAutoMode;
+    private Label labelAutoBias;
+    private TrackBar trackAutoBias;
+    private Label labelAutoPreview;
     private ComboBox comboDefaultTarget;
     private GroupBox groupTrim;
     private CheckBox checkEnableTrim;
@@ -54,6 +59,7 @@ partial class MainForm
     private Label labelFfmpegStatus;
     private Label labelOutputStatus;
     private Label labelBitrateStatus;
+    private ToolTip toolTipAutoMatch;
 
     private TableLayoutPanel logsLayout;
     private FlowLayoutPanel logsTopPanel;
@@ -103,6 +109,11 @@ partial class MainForm
         groupAuto = new GroupBox();
         checkAutoMatch = new CheckBox();
         labelAutoMatch = new Label();
+        labelAutoMode = new Label();
+        comboAutoMode = new ComboBox();
+        labelAutoBias = new Label();
+        trackAutoBias = new TrackBar();
+        labelAutoPreview = new Label();
         comboDefaultTarget = new ComboBox();
         groupTrim = new GroupBox();
         checkEnableTrim = new CheckBox();
@@ -125,6 +136,7 @@ partial class MainForm
         labelFfmpegStatus = new Label();
         labelOutputStatus = new Label();
         labelBitrateStatus = new Label();
+        toolTipAutoMatch = new ToolTip(components);
 
         logsLayout = new TableLayoutPanel();
         logsTopPanel = new FlowLayoutPanel();
@@ -233,20 +245,39 @@ partial class MainForm
         groupAuto.AutoSize = true;
         groupAuto.AutoSizeMode = AutoSizeMode.GrowAndShrink;
         groupAuto.Margin = new Padding(8);
-        var autoLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, Padding = new Padding(6), AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+        var autoLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 6, Padding = new Padding(6), AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
         autoLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         autoLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         checkAutoMatch.Text = "Auto match for new files";
         autoLayout.SetColumnSpan(checkAutoMatch, 2);
-        labelAutoMatch.Text = "Auto-match bitrate to keep quality";
+        labelAutoMatch.Text = "Auto match target bitrate from AV1 source bitrate (approximate)";
         labelAutoMatch.AutoSize = true;
         autoLayout.SetColumnSpan(labelAutoMatch, 2);
+        toolTipAutoMatch.SetToolTip(labelAutoMatch, "Auto match target bitrate from AV1 source bitrate (approximate)");
+        labelAutoMode.Text = "Mode";
+        labelAutoMode.AutoSize = true;
+        comboAutoMode.DropDownStyle = ComboBoxStyle.DropDownList;
+        comboAutoMode.Dock = DockStyle.Fill;
+        labelAutoBias.Text = "Bias";
+        labelAutoBias.AutoSize = true;
+        trackAutoBias.Dock = DockStyle.Fill;
+        trackAutoBias.Minimum = 0;
+        trackAutoBias.Maximum = 100;
+        trackAutoBias.TickFrequency = 10;
+        labelAutoPreview.AutoSize = true;
+        labelAutoPreview.Text = "Estimated target bitrate: --";
+        autoLayout.SetColumnSpan(labelAutoPreview, 2);
         autoLayout.Controls.Add(checkAutoMatch, 0, 0);
         autoLayout.Controls.Add(labelAutoMatch, 0, 1);
-        autoLayout.Controls.Add(new Label { Text = "Default target", AutoSize = true }, 0, 2);
+        autoLayout.Controls.Add(labelAutoMode, 0, 2);
+        autoLayout.Controls.Add(comboAutoMode, 1, 2);
+        autoLayout.Controls.Add(labelAutoBias, 0, 3);
+        autoLayout.Controls.Add(trackAutoBias, 1, 3);
+        autoLayout.Controls.Add(labelAutoPreview, 0, 4);
+        autoLayout.Controls.Add(new Label { Text = "Default target", AutoSize = true }, 0, 5);
         comboDefaultTarget.Dock = DockStyle.Fill;
         comboDefaultTarget.DropDownStyle = ComboBoxStyle.DropDownList;
-        autoLayout.Controls.Add(comboDefaultTarget, 1, 2);
+        autoLayout.Controls.Add(comboDefaultTarget, 1, 5);
         groupAuto.Controls.Add(autoLayout);
 
         groupTrim.Text = "Trim";

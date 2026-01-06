@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Globalization;
 using System.Text;
 using AplysiaAv1Transcoder.Models;
 using AplysiaAv1Transcoder.Services;
@@ -27,6 +28,7 @@ public partial class MainForm : Form
     public MainForm()
     {
         InitializeComponent();
+        AutoMatchService.DebugValidateScale();
 
         _storage = new StorageService();
         _settingsService = new SettingsService(_storage);
@@ -74,7 +76,14 @@ public partial class MainForm : Form
         btnDeletePreset.Click += (_, _) => DeletePreset();
         comboActivePreset.SelectedIndexChanged += (_, _) => OnActivePresetChanged();
 
-        checkAutoMatch.CheckedChanged += (_, _) => { _settings.AutoMatchForNewFiles = checkAutoMatch.Checked; UpdateStatusIndicators(); };
+        checkAutoMatch.CheckedChanged += (_, _) =>
+        {
+            _settings.AutoMatchForNewFiles = checkAutoMatch.Checked;
+            UpdateAutoMatchUiState();
+            UpdateStatusIndicators();
+        };
+        comboAutoMode.SelectedIndexChanged += (_, _) => OnAutoMatchModeChanged();
+        trackAutoBias.ValueChanged += (_, _) => OnAutoMatchBiasChanged();
         comboDefaultTarget.SelectedIndexChanged += (_, _) => SaveDefaultTarget();
 
         checkEnableTrim.CheckedChanged += (_, _) => ApplyTrimSettings();
@@ -106,9 +115,16 @@ public partial class MainForm : Form
     private void InitializeUiFromSettings()
     {
         comboDefaultTarget.Items.AddRange(new object[] { "H264", "H265" });
+        comboAutoMode.Items.AddRange(new object[] { "Balanced", "Safe" });
         comboPriority.Items.AddRange(new object[] { "Auto(HW)", "NVENC", "Intel QSV", "AMD AMF", "CPU" });
 
         checkAutoMatch.Checked = _settings.AutoMatchForNewFiles;
+        comboAutoMode.SelectedItem = _settings.AutoMatchMode.ToString();
+        if (comboAutoMode.SelectedIndex < 0)
+        {
+            comboAutoMode.SelectedIndex = 0;
+        }
+        trackAutoBias.Value = Math.Clamp(_settings.AutoMatchBias, trackAutoBias.Minimum, trackAutoBias.Maximum);
         comboDefaultTarget.SelectedItem = _settings.DefaultTargetCodec.ToString();
 
         checkSameAsSource.Checked = false;
@@ -124,6 +140,7 @@ public partial class MainForm : Form
         comboPriority.SelectedIndex = 0;
 
         UpdateTrimInputState();
+        UpdateAutoMatchUiState();
         UpdateStatusIndicators();
     }
 
@@ -229,18 +246,20 @@ public partial class MainForm : Form
             return;
         }
 
-        ApplyPreset(item, preset);
+        ApplyPreset(item, preset, GetAutoMatchConfigFromSettings());
     }
 
-    private void ApplyPreset(QueueItem item, Preset preset)
+    private void ApplyPreset(QueueItem item, Preset preset, AutoMatchConfig autoMatch)
     {
         item.PresetName = preset.Name;
+        item.AutoMatchMode = autoMatch.Mode;
+        item.AutoMatchBias = autoMatch.Bias;
         var snapshot = preset.Clone();
         if (preset.IsBuiltInAuto)
         {
-            var bitrate = ComputeAutoBitrate(item.ProbeInfo, preset.TargetCodec);
-            snapshot.BitrateKbps = bitrate;
-            item.AutoMatchedBitrateKbps = bitrate;
+            var result = ComputeAutoBitrate(item.ProbeInfo, preset.TargetCodec, autoMatch);
+            snapshot.BitrateKbps = result.TargetKbps;
+            item.AutoMatchedBitrateKbps = result.TargetKbps;
         }
         item.PresetSnapshot = snapshot;
     }
@@ -253,6 +272,7 @@ public partial class MainForm : Form
             return;
         }
 
+        var autoMatch = GetAutoMatchConfigFromUi();
         foreach (ListViewItem listItem in listQueue.SelectedItems)
         {
             if (listItem.Tag is not QueueItem item)
@@ -260,10 +280,11 @@ public partial class MainForm : Form
                 continue;
             }
 
-            ApplyPreset(item, preset);
+            ApplyPreset(item, preset, autoMatch);
             UpdateListViewItem(item, listItem);
         }
 
+        UpdateAutoMatchPreview();
         UpdateStatusIndicators();
     }
 
@@ -336,6 +357,114 @@ public partial class MainForm : Form
         textTrimEnd.Enabled = checkEnableTrim.Checked;
     }
 
+    private void OnAutoMatchModeChanged()
+    {
+        if (_isUpdatingSelection)
+        {
+            return;
+        }
+
+        var mode = ParseAutoMatchMode(comboAutoMode.SelectedItem?.ToString());
+        _settings.AutoMatchMode = mode;
+        var defaultBias = mode == AutoMatchMode.Balanced ? 0 : 100;
+        _isUpdatingSelection = true;
+        trackAutoBias.Value = defaultBias;
+        _isUpdatingSelection = false;
+        _settings.AutoMatchBias = trackAutoBias.Value;
+
+        ApplyAutoMatchConfigToSelected(new AutoMatchConfig(mode, trackAutoBias.Value));
+    }
+
+    private void OnAutoMatchBiasChanged()
+    {
+        if (_isUpdatingSelection)
+        {
+            return;
+        }
+
+        var autoMatch = GetAutoMatchConfigFromUi();
+        _settings.AutoMatchBias = autoMatch.Bias;
+        ApplyAutoMatchConfigToSelected(autoMatch);
+    }
+
+    private void UpdateAutoMatchUiState()
+    {
+        var enabled = checkAutoMatch.Checked;
+        comboAutoMode.Visible = enabled;
+        labelAutoMode.Visible = enabled;
+        trackAutoBias.Visible = enabled;
+        labelAutoBias.Visible = enabled;
+        labelAutoPreview.Visible = enabled;
+        UpdateAutoMatchPreview();
+    }
+
+    private AutoMatchConfig GetAutoMatchConfigFromSettings()
+    {
+        return new AutoMatchConfig(_settings.AutoMatchMode, _settings.AutoMatchBias);
+    }
+
+    private AutoMatchConfig GetAutoMatchConfigFromUi()
+    {
+        var mode = ParseAutoMatchMode(comboAutoMode.SelectedItem?.ToString());
+        var bias = Math.Clamp(trackAutoBias.Value, trackAutoBias.Minimum, trackAutoBias.Maximum);
+        return new AutoMatchConfig(mode, bias);
+    }
+
+    private void ApplyAutoMatchConfigToSelected(AutoMatchConfig autoMatch)
+    {
+        foreach (ListViewItem listItem in listQueue.SelectedItems)
+        {
+            if (listItem.Tag is not QueueItem item)
+            {
+                continue;
+            }
+
+            item.AutoMatchMode = autoMatch.Mode;
+            item.AutoMatchBias = autoMatch.Bias;
+
+            if (item.PresetSnapshot.IsBuiltInAuto)
+            {
+                var result = ComputeAutoBitrate(item.ProbeInfo, item.PresetSnapshot.TargetCodec, autoMatch);
+                item.PresetSnapshot.BitrateKbps = result.TargetKbps;
+                item.AutoMatchedBitrateKbps = result.TargetKbps;
+                UpdateListViewItem(item, listItem);
+            }
+        }
+
+        UpdateAutoMatchPreview();
+        UpdateStatusIndicators();
+    }
+
+    private void UpdateAutoMatchPreview()
+    {
+        if (!checkAutoMatch.Checked)
+        {
+            labelAutoPreview.Text = string.Empty;
+            return;
+        }
+
+        var item = listQueue.SelectedItems.Count > 0 ? listQueue.SelectedItems[0].Tag as QueueItem : null;
+        if (item?.ProbeInfo == null)
+        {
+            labelAutoPreview.Text = "Estimated target bitrate: --";
+            return;
+        }
+
+        var autoMatch = new AutoMatchConfig(item.AutoMatchMode, item.AutoMatchBias);
+        var result = ComputeAutoBitrate(item.ProbeInfo, item.PresetSnapshot.TargetCodec, autoMatch);
+        if (result.TargetKbps <= 0 || result.SourceKbps <= 0)
+        {
+            labelAutoPreview.Text = "Estimated target bitrate: --";
+            return;
+        }
+
+        var targetMbps = result.TargetKbps / 1000.0;
+        var sourceMbps = result.SourceKbps / 1000.0;
+        labelAutoPreview.Text = string.Format(CultureInfo.InvariantCulture,
+            "Estimated target bitrate: {0:0.0} Mbps (from source {1:0.0} Mbps, scale {2:0.00})",
+            targetMbps, sourceMbps, result.Scale);
+    }
+
     private void UpdateSelectionUi()
     {
         if (listQueue.SelectedItems.Count == 0)
@@ -345,8 +474,11 @@ public partial class MainForm : Form
             textTrimStart.Text = string.Empty;
             textTrimEnd.Text = string.Empty;
             comboPriority.SelectedIndex = 0;
+            comboAutoMode.SelectedItem = _settings.AutoMatchMode.ToString();
+            trackAutoBias.Value = Math.Clamp(_settings.AutoMatchBias, trackAutoBias.Minimum, trackAutoBias.Maximum);
             _isUpdatingSelection = false;
             UpdateTrimInputState();
+            UpdateAutoMatchPreview();
             UpdateStatusIndicators();
             return;
         }
@@ -361,9 +493,12 @@ public partial class MainForm : Form
         textTrimStart.Text = item.TrimStart ?? string.Empty;
         textTrimEnd.Text = item.TrimEnd ?? string.Empty;
         comboPriority.SelectedItem = PriorityLabel(item.PresetSnapshot.EncoderPriority);
+        comboAutoMode.SelectedItem = item.AutoMatchMode.ToString();
+        trackAutoBias.Value = Math.Clamp(item.AutoMatchBias, trackAutoBias.Minimum, trackAutoBias.Maximum);
         _isUpdatingSelection = false;
 
         UpdateTrimInputState();
+        UpdateAutoMatchPreview();
         UpdateStatusIndicators();
     }
 
@@ -957,6 +1092,8 @@ public partial class MainForm : Form
     {
         _settings.LastOutputFolder = textOutputFolder.Text.Trim();
         _settings.AutoMatchForNewFiles = checkAutoMatch.Checked;
+        _settings.AutoMatchMode = ParseAutoMatchMode(comboAutoMode.SelectedItem?.ToString());
+        _settings.AutoMatchBias = trackAutoBias.Value;
         SaveSplitterDistance();
         _settingsService.Save(_settings);
         SavePresets();
@@ -1029,38 +1166,19 @@ public partial class MainForm : Form
         return TimeSpan.FromSeconds(seconds).ToString(@"hh\:mm\:ss\.fff");
     }
 
-    private int ComputeAutoBitrate(ProbeInfo? info, TargetCodec target)
+    private static AutoMatchResult ComputeAutoBitrate(ProbeInfo? info, TargetCodec target, AutoMatchConfig autoMatch)
     {
         if (info == null)
         {
-            return 0;
+            return new AutoMatchResult(0, 0, 1);
         }
 
-        var videoKbps = info.VideoBitrateKbps;
-        if (videoKbps == null || videoKbps <= 0)
-        {
-            var audio = info.AudioBitrateKbps ?? 192;
-            var overall = info.OverallBitrateKbps ?? 0;
-            if (overall > 0)
-            {
-                videoKbps = Math.Max(0, overall - audio);
-            }
-        }
+        return AutoMatchService.ComputeAutoTarget(info, target, autoMatch);
+    }
 
-        if (videoKbps == null || videoKbps <= 0)
-        {
-            return 0;
-        }
-
-        var multiplier = target == TargetCodec.H264 ? 1.25 : 1.10;
-        if (info.Fps >= 60)
-        {
-            multiplier += 0.05;
-        }
-
-        var targetKbps = (int)Math.Round(videoKbps.Value * multiplier);
-        var min = target == TargetCodec.H264 ? 4000 : 3000;
-        return Math.Clamp(targetKbps, min, 80000);
+    private static AutoMatchMode ParseAutoMatchMode(string? text)
+    {
+        return Enum.TryParse(text, true, out AutoMatchMode mode) ? mode : AutoMatchMode.Balanced;
     }
 
     private static EncoderPriority? ParsePriority(string? text)
