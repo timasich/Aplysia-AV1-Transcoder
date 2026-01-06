@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Compression;
 using AplysiaAv1Transcoder.Models;
 
@@ -5,18 +6,20 @@ namespace AplysiaAv1Transcoder.Services;
 
 public sealed class FfmpegLocator
 {
-    public const string DefaultDownloadUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.zip";
+    public const string DefaultDownloadUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest";
 
     private readonly StorageService _storage;
     private readonly HttpClient _httpClient;
+    private readonly FfmpegDownloadService _downloadService;
 
     public FfmpegLocator(StorageService storage)
     {
         _storage = storage;
         _httpClient = new HttpClient();
+        _downloadService = new FfmpegDownloadService(_httpClient);
     }
 
-    public async Task<bool> ResolveAsync(AppSettings settings, IWin32Window owner)
+    public async Task<bool> ResolveAsync(AppSettings settings, IWin32Window owner, Action<LogEntry>? log = null, Action<string>? statusUpdate = null)
     {
         if (TryResolveCandidate(Path.Combine(_storage.AppFolder, "ffmpeg", "bin", "ffmpeg.exe"), out var ffprobePath))
         {
@@ -58,22 +61,48 @@ public sealed class FfmpegLocator
         {
             try
             {
-                var url = dialog.DownloadUrl;
-                var targetRoot = _storage.CanWriteTo(_storage.AppFolder) ? _storage.AppFolder : _storage.DataFolder;
-                var downloaded = await DownloadAndExtractAsync(url, targetRoot);
+                var installRoot = Path.Combine(_storage.AppFolder, "ffmpeg");
+                if (!_storage.CanWriteTo(_storage.AppFolder))
+                {
+                    MessageBox.Show(owner, "The application folder is not writable. Please run as administrator or download FFmpeg manually.",
+                        "FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                if (Directory.Exists(installRoot))
+                {
+                    var overwrite = MessageBox.Show(owner,
+                        "The .\\ffmpeg folder already exists. Overwrite it?",
+                        "FFmpeg",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+                    if (overwrite == DialogResult.Cancel || overwrite == DialogResult.No)
+                    {
+                        statusUpdate?.Invoke("FFmpeg download skipped.");
+                        return false;
+                    }
+
+                    Directory.Delete(installRoot, true);
+                }
+
+                var downloaded = await DownloadAndExtractAsync(installRoot, log, statusUpdate);
                 if (downloaded == null)
                 {
+                    statusUpdate?.Invoke("FFmpeg: Failed");
                     MessageBox.Show(owner, "FFmpeg download completed but binaries were not found.",
                         "FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return false;
                 }
 
                 ApplyResolved(settings, downloaded.Value.ffmpegPath, downloaded.Value.ffprobePath);
+                statusUpdate?.Invoke("FFmpeg: Done");
                 return true;
             }
             catch (Exception ex)
             {
-                MessageBox.Show(owner, $"FFmpeg download failed: {ex.Message}", "FFmpeg", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                statusUpdate?.Invoke("FFmpeg: Failed");
+                log?.Invoke(new LogEntry { Level = LogLevel.Error, Message = $"FFmpeg download failed: {ex.Message}" });
+                ShowDownloadFailure(owner, ex.Message);
                 return false;
             }
         }
@@ -138,24 +167,34 @@ public sealed class FfmpegLocator
         return true;
     }
 
-    private async Task<(string ffmpegPath, string ffprobePath)?> DownloadAndExtractAsync(string url, string targetRoot)
+    private async Task<(string ffmpegPath, string ffprobePath)?> DownloadAndExtractAsync(string installRoot, Action<LogEntry>? log, Action<string>? statusUpdate)
     {
-        var zipPath = Path.Combine(Path.GetTempPath(), $"ffmpeg_{Guid.NewGuid():N}.zip");
-        await using (var output = File.Create(zipPath))
-        {
-            using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-            response.EnsureSuccessStatusCode();
-            await using var input = await response.Content.ReadAsStreamAsync();
-            await input.CopyToAsync(output);
-        }
+        statusUpdate?.Invoke("FFmpeg: Fetching release info...");
+        var asset = await _downloadService.GetLatestWin64GplAssetAsync();
+        log?.Invoke(new LogEntry { Level = LogLevel.Info, Message = $"FFmpeg asset selected: {asset.Name}" });
+        log?.Invoke(new LogEntry { Level = LogLevel.Info, Message = $"FFmpeg download URL: {asset.DownloadUrl}" });
 
-        var extractRoot = Path.Combine(targetRoot, "ffmpeg");
-        Directory.CreateDirectory(extractRoot);
-        ZipFile.ExtractToDirectory(zipPath, extractRoot, true);
+        statusUpdate?.Invoke("FFmpeg: Downloading...");
+        var zipPath = Path.Combine(Path.GetTempPath(), $"ffmpeg_{Guid.NewGuid():N}.zip");
+        var lastLogged = -10;
+        var progress = new Progress<int>(percent =>
+        {
+            statusUpdate?.Invoke($"FFmpeg: Downloading... {percent}%");
+            if (percent >= lastLogged + 10 || percent == 100)
+            {
+                lastLogged = percent;
+                log?.Invoke(new LogEntry { Level = LogLevel.Info, Message = $"FFmpeg download {percent}%" });
+            }
+        });
+        await _downloadService.DownloadAssetAsync(asset.DownloadUrl, zipPath, progress);
+
+        statusUpdate?.Invoke("FFmpeg: Extracting...");
+        Directory.CreateDirectory(installRoot);
+        ZipFile.ExtractToDirectory(zipPath, installRoot, true);
         File.Delete(zipPath);
 
-        var ffmpeg = FindFirstBinary(extractRoot, "ffmpeg.exe");
-        var ffprobe = FindFirstBinary(extractRoot, "ffprobe.exe");
+        var ffmpeg = FindFirstBinary(installRoot, "ffmpeg.exe");
+        var ffprobe = FindFirstBinary(installRoot, "ffprobe.exe");
         if (ffmpeg == null || ffprobe == null)
         {
             return null;
@@ -174,5 +213,24 @@ public sealed class FfmpegLocator
 
         var preferred = matches.FirstOrDefault(path => path.Contains("\\bin\\", StringComparison.OrdinalIgnoreCase));
         return preferred ?? matches[0];
+    }
+
+    private static void ShowDownloadFailure(IWin32Window owner, string reason)
+    {
+        var page = new TaskDialogPage
+        {
+            Caption = "FFmpeg",
+            Heading = "Automatic FFmpeg download failed",
+            Text = $"Automatic FFmpeg download failed: {reason}. You can download manually from https://github.com/BtbN/FFmpeg-Builds/releases/latest and then select ffmpeg.exe."
+        };
+        var openButton = new TaskDialogButton("Open download page");
+        page.Buttons.Add(openButton);
+        page.Buttons.Add(TaskDialogButton.Close);
+
+        var result = TaskDialog.ShowDialog(owner, page);
+        if (result == openButton)
+        {
+            Process.Start(new ProcessStartInfo(DefaultDownloadUrl) { UseShellExecute = true });
+        }
     }
 }

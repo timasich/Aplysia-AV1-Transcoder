@@ -65,8 +65,8 @@ public sealed class FfmpegSetupForm : Form
         layout.Controls.Add(_pathTextBox, 0, 1);
         layout.Controls.Add(browseButton, 1, 1);
 
-        var urlLabel = new Label { Text = "Download URL:", AutoSize = true };
-        _urlTextBox = new TextBox { Dock = DockStyle.Fill, Text = defaultUrl };
+        var urlLabel = new Label { Text = "Download page:", AutoSize = true };
+        _urlTextBox = new TextBox { Dock = DockStyle.Fill, Text = defaultUrl, ReadOnly = true };
         layout.Controls.Add(urlLabel, 0, 2);
         layout.SetColumnSpan(_urlTextBox, 3);
         layout.Controls.Add(_urlTextBox, 0, 3);

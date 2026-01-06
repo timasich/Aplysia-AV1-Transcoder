@@ -12,6 +12,7 @@ public partial class MainForm : Form
     private readonly PresetService _presetService;
     private readonly FfmpegLocator _ffmpegLocator;
     private readonly FfprobeService _ffprobeService;
+    private readonly DurationService _durationService;
     private readonly EncoderCapabilitiesService _encoderCapabilitiesService;
     private readonly TranscodeService _transcodeService;
 
@@ -22,12 +23,16 @@ public partial class MainForm : Form
     private CancellationTokenSource? _queueCts;
     private bool _isProcessing;
     private bool _isUpdatingSelection;
+    private bool _suppressTrimText;
     private Color _trimPanelDefaultColor;
+    private Color _trimTextBoxDefaultColor;
+    private ContextMenuStrip? _queueContextMenu;
 
     public MainForm()
     {
         InitializeComponent();
 
+        InitializeTrayIcon();
         ConfigureQueueColumns();
 
         _storage = new StorageService();
@@ -41,16 +46,41 @@ public partial class MainForm : Form
         _settings = _settingsService.Load();
         _userPresets = _presetService.LoadPresets();
         _trimPanelDefaultColor = trimPanel.BackColor;
+        _trimTextBoxDefaultColor = textTrimStart.BackColor;
+        _durationService = new DurationService(
+            new (DurationSource, IVideoDurationProvider)[]
+            {
+                (DurationSource.Shell, new ShellDurationProvider(AddLog)),
+                (DurationSource.MediaFoundation, new MediaFoundationDurationProvider(AddLog)),
+                (DurationSource.Ffprobe, new FfprobeDurationProvider(() => _settings.ResolvedFfprobePath, AddLog))
+            },
+            AddLog);
 
         WireEvents();
         InitializeUiFromSettings();
+    }
+
+    private void InitializeTrayIcon()
+    {
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "icon.ico");
+        if (File.Exists(iconPath))
+        {
+            notifyIcon.Icon = new Icon(iconPath);
+        }
+        else
+        {
+            notifyIcon.Icon = Icon;
+        }
+
+        notifyIcon.Text = Text;
+        notifyIcon.Visible = true;
     }
 
     protected override async void OnShown(EventArgs e)
     {
         base.OnShown(e);
         ApplySplitterDistance();
-        var resolved = await _ffmpegLocator.ResolveAsync(_settings, this);
+        var resolved = await _ffmpegLocator.ResolveAsync(_settings, this, AddLog, UpdateFfmpegDownloadStatus);
         if (resolved)
         {
             _settingsService.Save(_settings);
@@ -68,6 +98,7 @@ public partial class MainForm : Form
         btnMoveDown.Click += (_, _) => MoveSelected(1);
         btnStart.Click += async (_, _) => await StartQueueAsync();
         btnCancel.Click += (_, _) => CancelQueue();
+        checkUncheckAfterRender.CheckedChanged += (_, _) => OnUncheckAfterRenderChanged();
 
         btnApplyPreset.Click += (_, _) => ApplyPresetToSelected();
         btnNewPreset.Click += (_, _) => CreatePreset();
@@ -77,25 +108,23 @@ public partial class MainForm : Form
         comboActivePreset.SelectedIndexChanged += (_, _) => OnActivePresetChanged();
 
         checkEnableTrim.CheckedChanged += (_, _) => ApplyTrimSettings();
-        numTrimStartHours.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimStartMinutes.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimStartSeconds.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimStartMilliseconds.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimEndHours.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimEndMinutes.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimEndSeconds.ValueChanged += (_, _) => ApplyTrimSettings();
-        numTrimEndMilliseconds.ValueChanged += (_, _) => ApplyTrimSettings();
+        trimTimeline.RangeChanged += (_, _) => OnTrimTimelineChanged();
+        textTrimStart.TextChanged += (_, _) => OnTrimTextChanged();
+        textTrimEnd.TextChanged += (_, _) => OnTrimTextChanged();
+        btnResetTrim.Click += (_, _) => ResetTrimForSelected();
 
         checkSameAsSource.CheckedChanged += (_, _) => OnOutputModeChanged();
         textOutputFolder.TextChanged += (_, _) => OnOutputFolderChanged();
         btnBrowseOutput.Click += (_, _) => BrowseOutputFolder();
         comboRecentOutputs.SelectedIndexChanged += (_, _) => SelectRecentOutputFolder();
 
-        comboPriority.SelectedIndexChanged += (_, _) => ApplyPriorityToSelected();
+        comboPriority.SelectedIndexChanged += (_, _) => OnEncoderPriorityChanged();
+        trackSpeedQuality.ValueChanged += (_, _) => OnSpeedQualityChanged();
         btnFfmpegSettings.Click += (_, _) => OpenFfmpegSettings();
 
         listQueue.SelectedIndexChanged += (_, _) => UpdateSelectionUi();
-        listQueue.ItemChecked += (_, _) => UpdateStatusIndicators();
+        listQueue.ItemChecked += (_, e) => OnQueueItemChecked(e);
+        listQueue.MouseDown += ListQueueOnMouseDown;
         listQueue.DragEnter += ListQueueOnDragEnter;
         listQueue.DragDrop += async (_, e) => await ListQueueOnDragDropAsync(e);
         splitQueue.SplitterMoved += (_, _) => SaveSplitterDistance();
@@ -114,6 +143,7 @@ public partial class MainForm : Form
 
         checkSameAsSource.Checked = false;
         textOutputFolder.Text = _settings.LastOutputFolder ?? string.Empty;
+        checkUncheckAfterRender.Checked = _settings.UncheckAfterRender;
 
         comboRecentOutputs.Items.Clear();
         foreach (var path in _settings.RecentOutputFolders)
@@ -122,9 +152,20 @@ public partial class MainForm : Form
         }
 
         LoadPresetsIntoUi();
-        comboPriority.SelectedIndex = 0;
+        comboPriority.SelectedItem = PriorityLabel(_settings.EncoderPriority);
+        if (comboPriority.SelectedIndex < 0)
+        {
+            comboPriority.SelectedIndex = 0;
+        }
 
-        UpdateTrimInputState();
+        trackSpeedQuality.Minimum = 1;
+        trackSpeedQuality.Maximum = 9;
+        var speedQuality = _settings.SpeedQuality <= 0 ? 5 : _settings.SpeedQuality;
+        trackSpeedQuality.Value = Math.Clamp(speedQuality, trackSpeedQuality.Minimum, trackSpeedQuality.Maximum);
+
+        UpdateFfmpegDownloadStatus(string.Empty);
+        groupTrim.Visible = true;
+        groupTrim.Enabled = false;
         UpdateStatusIndicators();
     }
 
@@ -203,6 +244,7 @@ public partial class MainForm : Form
             var item = new QueueItem
             {
                 FilePath = file,
+                Render = true,
                 Status = "Queued"
             };
 
@@ -212,7 +254,9 @@ public partial class MainForm : Form
             listItem.Checked = true;
             listQueue.Items.Add(listItem);
 
+            _ = UpdateDurationForItemAsync(item);
             await ProbeAndApplyPresetAsync(item);
+            InitializeTrimDefaults(item);
             UpdateListViewItem(item, listItem);
         }
 
@@ -242,11 +286,61 @@ public partial class MainForm : Form
         ApplyPreset(item, preset);
     }
 
+    private async Task UpdateDurationForItemAsync(QueueItem item)
+    {
+        try
+        {
+            var (duration, source) = await _durationService.TryGetDurationAsync(item.FilePath, CancellationToken.None);
+            item.Duration = duration;
+            item.DurationSource = source;
+
+            if (duration.HasValue)
+            {
+                if (!item.TrimWasEditedByUser)
+                {
+                    item.TrimStart = FormatTrimTime(TimeSpan.Zero);
+                    item.TrimEnd = FormatTrimTime(duration.Value);
+                }
+
+                AddLog(new LogEntry
+                {
+                    Level = LogLevel.Info,
+                    Message = $"Duration detected: {FormatTrimTime(duration.Value)} (Source: {source})"
+                });
+            }
+            else
+            {
+                AddLog(new LogEntry
+                {
+                    Level = LogLevel.Info,
+                    Message = "Duration unavailable (Shell/MF/Ffprobe failed)"
+                });
+            }
+
+            var listItem = FindListViewItem(item);
+            if (listItem != null)
+            {
+                UpdateListViewItem(item, listItem);
+            }
+
+            if (listQueue.SelectedItems.Count == 1 && listQueue.SelectedItems[0].Tag == item)
+            {
+                _isUpdatingSelection = true;
+                UpdateTrimUiFromItem(item);
+                _isUpdatingSelection = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            AddLog(new LogEntry { Level = LogLevel.Warning, Message = $"Duration detection failed: {ex.Message}" });
+        }
+    }
+
     private void ApplyPreset(QueueItem item, Preset preset)
     {
+        item.PresetId = preset.Id;
         item.PresetName = preset.Name;
         var snapshot = preset.Clone();
-        snapshot.EncoderPriority = ParsePriority(comboPriority.SelectedItem?.ToString()) ?? EncoderPriority.AutoHW;
         item.PresetSnapshot = snapshot;
     }
 
@@ -258,43 +352,22 @@ public partial class MainForm : Form
             return;
         }
 
-        foreach (ListViewItem listItem in listQueue.SelectedItems)
-        {
-            if (listItem.Tag is not QueueItem item)
-            {
-                continue;
-            }
-
-            ApplyPreset(item, preset);
-            UpdateListViewItem(item, listItem);
-        }
-
-        UpdateStatusIndicators();
+        ApplyPresetToSelection(preset);
     }
 
-    private void ApplyPriorityToSelected()
+    private void OnEncoderPriorityChanged()
     {
-        if (_isUpdatingSelection)
-        {
-            return;
-        }
+        _settings.EncoderPriority = ParsePriority(comboPriority.SelectedItem?.ToString()) ?? EncoderPriority.AutoHW;
+    }
 
-        var priority = ParsePriority(comboPriority.SelectedItem?.ToString());
-        if (priority == null)
-        {
-            return;
-        }
+    private void OnSpeedQualityChanged()
+    {
+        _settings.SpeedQuality = trackSpeedQuality.Value;
+    }
 
-        foreach (ListViewItem listItem in listQueue.SelectedItems)
-        {
-            if (listItem.Tag is not QueueItem item)
-            {
-                continue;
-            }
-
-            item.PresetSnapshot.EncoderPriority = priority.Value;
-            UpdateListViewItem(item, listItem);
-        }
+    private void OnUncheckAfterRenderChanged()
+    {
+        _settings.UncheckAfterRender = checkUncheckAfterRender.Checked;
     }
 
     private void ApplyTrimSettings()
@@ -304,80 +377,144 @@ public partial class MainForm : Form
             return;
         }
 
-        QueueItem? firstItem = null;
-        var trimStart = FormatTrimTime(GetTrimStartTime());
-        var trimEnd = FormatTrimTime(GetTrimEndTime());
-
-        if (checkEnableTrim.Checked && trimEnd == FormatTrimTime(TimeSpan.Zero))
+        if (listQueue.SelectedItems.Count != 1)
         {
-            var selectedItem = listQueue.SelectedItems.Count > 0 ? listQueue.SelectedItems[0].Tag as QueueItem : null;
-            if (selectedItem?.ProbeInfo?.DurationSeconds > 0)
-            {
-                trimEnd = FormatDuration(selectedItem.ProbeInfo.DurationSeconds);
-                _isUpdatingSelection = true;
-                SetTrimEndControls(ParseTrimTime(trimEnd));
-                _isUpdatingSelection = false;
-            }
+            return;
         }
 
-        foreach (ListViewItem listItem in listQueue.SelectedItems)
+        if (listQueue.SelectedItems[0].Tag is not QueueItem item)
         {
-            if (listItem.Tag is not QueueItem item)
-            {
-                continue;
-            }
-
-            firstItem ??= item;
-            item.TrimEnabled = checkEnableTrim.Checked;
-            item.TrimStart = trimStart;
-            item.TrimEnd = trimEnd;
-
-            if (item.TrimEnabled && item.ProbeInfo?.DurationSeconds > 0 && string.IsNullOrWhiteSpace(item.TrimEnd))
-            {
-                item.TrimEnd = FormatDuration(item.ProbeInfo.DurationSeconds);
-            }
-
-            UpdateListViewItem(item, listItem);
+            return;
         }
 
-        if (firstItem != null && firstItem.TrimEnabled && !string.IsNullOrWhiteSpace(firstItem.TrimEnd))
+        item.TrimEnabled = checkEnableTrim.Checked;
+        SetTrimInputsEnabled(item.TrimEnabled);
+        if (!item.TrimEnabled)
         {
-            _isUpdatingSelection = true;
-            SetTrimEndControls(ParseTrimTime(firstItem.TrimEnd));
-            _isUpdatingSelection = false;
+            labelTrimError.Visible = false;
+            UpdateListViewItem(item, listQueue.SelectedItems[0]);
+            UpdateTrimValidation();
+            UpdateStatusIndicators();
+            return;
         }
 
-        UpdateTrimInputState();
+        EnsureTrimDefaults(item);
+        UpdateTrimUiFromItem(item);
+        UpdateListViewItem(item, listQueue.SelectedItems[0]);
         UpdateTrimValidation();
         UpdateStatusIndicators();
     }
 
-    private void UpdateTrimInputState()
+    private void InitializeTrimDefaults(QueueItem item)
     {
-        var enabled = checkEnableTrim.Checked;
-        numTrimStartHours.Enabled = enabled;
-        numTrimStartMinutes.Enabled = enabled;
-        numTrimStartSeconds.Enabled = enabled;
-        numTrimStartMilliseconds.Enabled = enabled;
-        numTrimEndHours.Enabled = enabled;
-        numTrimEndMinutes.Enabled = enabled;
-        numTrimEndSeconds.Enabled = enabled;
-        numTrimEndMilliseconds.Enabled = enabled;
+        item.TrimStart = FormatTrimTime(TimeSpan.Zero);
+        if (item.Duration.HasValue && item.Duration.Value > TimeSpan.Zero)
+        {
+            item.TrimEnd = FormatTrimTime(item.Duration.Value);
+        }
+        else
+        {
+            item.TrimEnd = string.Empty;
+        }
+
+        item.TrimEnabled = false;
+        item.TrimWasEditedByUser = false;
     }
 
+    private void EnsureTrimDefaults(QueueItem item)
+    {
+        if (string.IsNullOrWhiteSpace(item.TrimStart))
+        {
+            item.TrimStart = FormatTrimTime(TimeSpan.Zero);
+        }
+
+        if (string.IsNullOrWhiteSpace(item.TrimEnd))
+        {
+            item.TrimEnd = item.Duration.HasValue && item.Duration.Value > TimeSpan.Zero
+                ? FormatTrimTime(item.Duration.Value)
+                : string.Empty;
+        }
+
+        if (item.TrimWasEditedByUser)
+        {
+            return;
+        }
+
+        if (item.Duration.HasValue && item.Duration.Value > TimeSpan.Zero)
+        {
+            var duration = item.Duration.Value;
+            if (!TryParseTrimTime(item.TrimStart, out var start) || start < TimeSpan.Zero)
+            {
+                start = TimeSpan.Zero;
+            }
+
+            if (start > duration)
+            {
+                start = duration;
+            }
+
+            if (!TryParseTrimTime(item.TrimEnd, out var end) || end == TimeSpan.Zero)
+            {
+                end = duration;
+            }
+            else if (end > duration)
+            {
+                end = duration;
+            }
+
+            item.TrimStart = FormatTrimTime(start);
+            item.TrimEnd = FormatTrimTime(end);
+        }
+    }
+
+    private void ResetTrimForSelected()
+    {
+        if (listQueue.SelectedItems.Count != 1)
+        {
+            return;
+        }
+
+        if (listQueue.SelectedItems[0].Tag is not QueueItem item)
+        {
+            return;
+        }
+
+        InitializeTrimDefaults(item);
+        _isUpdatingSelection = true;
+        checkEnableTrim.Checked = item.TrimEnabled;
+        UpdateTrimUiFromItem(item);
+        _isUpdatingSelection = false;
+
+        SetTrimInputsEnabled(checkEnableTrim.Checked);
+        UpdateListViewItem(item, listQueue.SelectedItems[0]);
+        AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Trim reset: {item.FilePath}" });
+        UpdateTrimValidation();
+        UpdateStatusIndicators();
+    }
+
+    private void SetTrimInputsEnabled(bool enabled)
+    {
+        trimTimeline.Enabled = enabled && trimTimeline.DurationSeconds > 0;
+        textTrimStart.Enabled = enabled;
+        textTrimEnd.Enabled = enabled;
+        btnResetTrim.Enabled = enabled;
+    }
 
     private void UpdateSelectionUi()
     {
-        if (listQueue.SelectedItems.Count == 0)
+        if (listQueue.SelectedItems.Count != 1)
         {
-            _isUpdatingSelection = true;
-            checkEnableTrim.Checked = false;
-            comboPriority.SelectedIndex = 0;
-            SetTrimStartControls(TimeSpan.Zero);
-            SetTrimEndControls(TimeSpan.Zero);
-            _isUpdatingSelection = false;
-            UpdateTrimInputState();
-            UpdateTrimValidation();
+            groupTrim.Enabled = true;
+            trimPanel.Visible = true;
+            labelTrimHint.Visible = true;
+            trimTimeline.Visible = false;
+            labelTrimStart.Visible = false;
+            labelTrimEnd.Visible = false;
+            textTrimStart.Visible = false;
+            textTrimEnd.Visible = false;
+            labelTrimError.Visible = false;
+            btnResetTrim.Visible = false;
+            SetTrimInputsEnabled(false);
             UpdateStatusIndicators();
             return;
         }
@@ -387,18 +524,24 @@ public partial class MainForm : Form
             return;
         }
 
+        groupTrim.Enabled = true;
+        trimPanel.Visible = true;
+        trimTimeline.Visible = true;
+        labelTrimStart.Visible = true;
+        labelTrimEnd.Visible = true;
+        textTrimStart.Visible = true;
+        textTrimEnd.Visible = true;
+        btnResetTrim.Visible = true;
+        groupTrim.PerformLayout();
+        trimPanel.PerformLayout();
+
         _isUpdatingSelection = true;
         checkEnableTrim.Checked = item.TrimEnabled;
-        SetTrimStartControls(ParseTrimTime(item.TrimStart));
-        if (item.TrimEnabled && string.IsNullOrWhiteSpace(item.TrimEnd) && item.ProbeInfo?.DurationSeconds > 0)
-        {
-            item.TrimEnd = FormatDuration(item.ProbeInfo.DurationSeconds);
-        }
-        SetTrimEndControls(ParseTrimTime(item.TrimEnd));
-        comboPriority.SelectedItem = PriorityLabel(item.PresetSnapshot.EncoderPriority);
+        EnsureTrimDefaults(item);
+        UpdateTrimUiFromItem(item);
         _isUpdatingSelection = false;
 
-        UpdateTrimInputState();
+        SetTrimInputsEnabled(checkEnableTrim.Checked);
         UpdateTrimValidation();
         UpdateStatusIndicators();
     }
@@ -431,7 +574,7 @@ public partial class MainForm : Form
 
     private void CreatePreset()
     {
-        var preset = new Preset { Name = "New Preset" };
+        var preset = new Preset { Id = Guid.NewGuid(), Name = "New Preset" };
         using var dialog = new PresetEditorForm(preset, "New Preset", GetSelectedProbeInfo);
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.ResultPreset == null)
         {
@@ -473,6 +616,7 @@ public partial class MainForm : Form
         }
 
         var copy = preset.Clone($"{preset.Name} Copy");
+        copy.Id = Guid.NewGuid();
         using var dialog = new PresetEditorForm(copy, "Duplicate Preset", GetSelectedProbeInfo);
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.ResultPreset == null)
         {
@@ -592,7 +736,7 @@ public partial class MainForm : Form
     {
         EnsureListViewSubItems(listItem);
         listItem.Text = item.IsAv1 ? item.FilePath : $"[NOT AV1] {item.FilePath}";
-        listItem.SubItems[1].Text = item.PresetName;
+        listItem.SubItems[1].Text = string.IsNullOrWhiteSpace(item.PresetName) ? "None" : item.PresetName;
         listItem.SubItems[2].Text = item.TrimEnabled
             ? $"{item.TrimStart ?? ""}-{item.TrimEnd ?? ""}".Trim('-')
             : string.Empty;
@@ -600,6 +744,19 @@ public partial class MainForm : Form
         listItem.SubItems[4].Text = FormatEstimatedSize(item);
         listItem.SubItems[5].Text = item.Status;
         listItem.ForeColor = item.IsAv1 ? listQueue.ForeColor : Color.Red;
+    }
+
+    private ListViewItem? FindListViewItem(QueueItem item)
+    {
+        foreach (ListViewItem listItem in listQueue.Items)
+        {
+            if (ReferenceEquals(listItem.Tag, item))
+            {
+                return listItem;
+            }
+        }
+
+        return null;
     }
 
     private string FormatEstimatedSize(QueueItem item)
@@ -654,6 +811,11 @@ public partial class MainForm : Form
         if (checkSameAsSource.Checked)
         {
             return Path.GetDirectoryName(item.FilePath) ?? string.Empty;
+        }
+
+        if (!string.IsNullOrWhiteSpace(item.OutputFolder))
+        {
+            return item.OutputFolder;
         }
 
         return textOutputFolder.Text.Trim();
@@ -730,6 +892,167 @@ public partial class MainForm : Form
         }
     }
 
+    private void OnQueueItemChecked(ItemCheckedEventArgs e)
+    {
+        if (e.Item?.Tag is QueueItem item)
+        {
+            item.Render = e.Item.Checked;
+        }
+
+        UpdateStatusIndicators();
+    }
+
+    private void ListQueueOnMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right)
+        {
+            return;
+        }
+
+        var hit = listQueue.GetItemAt(e.X, e.Y);
+        if (hit == null)
+        {
+            ShowQueueContextMenu(e.Location, false);
+            return;
+        }
+
+        if (!hit.Selected)
+        {
+            listQueue.SelectedItems.Clear();
+            hit.Selected = true;
+        }
+
+        ShowQueueContextMenu(e.Location, true);
+    }
+
+    private void ShowQueueContextMenu(Point location, bool hasSelection)
+    {
+        _queueContextMenu?.Dispose();
+        _queueContextMenu = new ContextMenuStrip();
+
+        if (!hasSelection)
+        {
+            var addFiles = new ToolStripMenuItem("Add files...");
+            addFiles.Click += async (_, _) => await AddFilesFromDialogAsync();
+            _queueContextMenu.Items.Add(addFiles);
+            _queueContextMenu.Show(listQueue, location);
+            return;
+        }
+
+        var presetMenu = new ToolStripMenuItem("Preset");
+        if (_userPresets.Count == 0)
+        {
+            presetMenu.Enabled = false;
+        }
+        else
+        {
+            foreach (var preset in _userPresets)
+            {
+                var item = new ToolStripMenuItem(preset.Name) { Tag = preset };
+                item.Click += (_, _) => ApplyPresetToSelection(preset);
+                presetMenu.DropDownItems.Add(item);
+            }
+        }
+
+        var outputMenu = new ToolStripMenuItem("Output folder");
+        if (_settings.RecentOutputFolders.Count == 0)
+        {
+            outputMenu.DropDownItems.Add(new ToolStripMenuItem("(No recent folders)") { Enabled = false });
+        }
+        else
+        {
+            foreach (var path in _settings.RecentOutputFolders)
+            {
+                var item = new ToolStripMenuItem(path);
+                item.Click += (_, _) => SetOutputFolderForSelected(path);
+                outputMenu.DropDownItems.Add(item);
+            }
+        }
+        outputMenu.DropDownItems.Add(new ToolStripSeparator());
+        var browseItem = new ToolStripMenuItem("Browse...");
+        browseItem.Click += (_, _) => BrowseOutputFolderForSelected();
+        outputMenu.DropDownItems.Add(browseItem);
+
+        var toggleRender = new ToolStripMenuItem("Toggle Render");
+        toggleRender.Click += (_, _) => ToggleRenderForSelected();
+
+        var removeSelected = new ToolStripMenuItem("Remove selected");
+        removeSelected.Click += (_, _) => RemoveSelectedItems();
+
+        _queueContextMenu.Items.Add(presetMenu);
+        _queueContextMenu.Items.Add(outputMenu);
+        _queueContextMenu.Items.Add(toggleRender);
+        _queueContextMenu.Items.Add(new ToolStripSeparator());
+        _queueContextMenu.Items.Add(removeSelected);
+        _queueContextMenu.Show(listQueue, location);
+    }
+
+    private void ApplyPresetToSelection(Preset preset)
+    {
+        foreach (ListViewItem listItem in listQueue.SelectedItems)
+        {
+            if (listItem.Tag is not QueueItem item)
+            {
+                continue;
+            }
+
+            ApplyPreset(item, preset);
+            UpdateListViewItem(item, listItem);
+            AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Preset applied: {preset.Name} -> {item.FilePath}" });
+        }
+
+        UpdateStatusIndicators();
+    }
+
+    private void SetOutputFolderForSelected(string path)
+    {
+        foreach (ListViewItem listItem in listQueue.SelectedItems)
+        {
+            if (listItem.Tag is not QueueItem item)
+            {
+                continue;
+            }
+
+            item.OutputFolder = path;
+            UpdateListViewItem(item, listItem);
+        }
+
+        AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Output folder set for selection: {path}" });
+        UpdateStatusIndicators();
+    }
+
+    private void BrowseOutputFolderForSelected()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Select output folder"
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var path = dialog.SelectedPath;
+        AddRecentOutputFolder(path);
+        SetOutputFolderForSelected(path);
+    }
+
+    private void ToggleRenderForSelected()
+    {
+        var selected = listQueue.SelectedItems.Cast<ListViewItem>().ToList();
+        if (selected.Count == 0)
+        {
+            return;
+        }
+
+        var shouldCheck = selected.Any(item => !item.Checked);
+        foreach (var listItem in selected)
+        {
+            listItem.Checked = shouldCheck;
+        }
+    }
+
     private void ListQueueOnDragEnter(object? sender, DragEventArgs e)
     {
         if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
@@ -765,9 +1088,10 @@ public partial class MainForm : Form
             AddRecentOutputFolder(textOutputFolder.Text.Trim());
         }
 
-        var items = listQueue.CheckedItems.Cast<ListViewItem>()
-            .Select(i => i.Tag)
-            .OfType<QueueItem>()
+        var items = listQueue.Items.Cast<ListViewItem>()
+            .Select(i => (listItem: i, item: i.Tag as QueueItem))
+            .Where(pair => pair.item != null && pair.item.Render)
+            .Select(pair => (pair.listItem, item: pair.item!))
             .ToList();
 
         if (items.Count == 0)
@@ -787,8 +1111,9 @@ public partial class MainForm : Form
             capabilities = await _encoderCapabilitiesService.GetCapabilitiesAsync(_settings.ResolvedFfmpegPath);
         }
 
-        foreach (var item in items)
+        foreach (var entry in items)
         {
+            var item = entry.item;
             if (_queueCts.IsCancellationRequested)
             {
                 item.Status = "Canceled";
@@ -817,7 +1142,15 @@ public partial class MainForm : Form
                 }
             }
 
-            var result = await _transcodeService.RunAsync(item, _settings.ResolvedFfmpegPath!, capabilities!, outputPath, AddLog, _queueCts.Token);
+            var result = await _transcodeService.RunAsync(
+                item,
+                _settings.ResolvedFfmpegPath!,
+                capabilities!,
+                outputPath,
+                _settings.EncoderPriority,
+                _settings.SpeedQuality,
+                AddLog,
+                _queueCts.Token);
             if (_queueCts.IsCancellationRequested)
             {
                 item.Status = "Canceled";
@@ -829,7 +1162,12 @@ public partial class MainForm : Form
 
             UpdateItemStatus(item);
 
-            if (!result.Success)
+            if (result.Success && _settings.UncheckAfterRender && OutputSucceeded(outputPath))
+            {
+                entry.listItem.Checked = false;
+                AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Auto-unchecked after render: {item.FilePath}" });
+            }
+            else if (!result.Success)
             {
                 tabControl.SelectedTab = tabLogs;
                 ScrollLogsToEnd();
@@ -854,6 +1192,17 @@ public partial class MainForm : Form
         }
     }
 
+    private static bool OutputSucceeded(string outputPath)
+    {
+        if (string.IsNullOrWhiteSpace(outputPath) || !File.Exists(outputPath))
+        {
+            return false;
+        }
+
+        var info = new FileInfo(outputPath);
+        return info.Length > 0;
+    }
+
     private void CancelQueue()
     {
         _queueCts?.Cancel();
@@ -870,17 +1219,26 @@ public partial class MainForm : Form
 
         if (!checkSameAsSource.Checked)
         {
-            var folder = textOutputFolder.Text.Trim();
-            if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+            var globalFolder = textOutputFolder.Text.Trim();
+            foreach (ListViewItem listItem in listQueue.Items)
             {
-                MessageBox.Show(this, "Output folder is invalid.", "Output", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return false;
+                if (listItem.Tag is not QueueItem item || !item.Render)
+                {
+                    continue;
+                }
+
+                var folder = string.IsNullOrWhiteSpace(item.OutputFolder) ? globalFolder : item.OutputFolder;
+                if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+                {
+                    MessageBox.Show(this, "Output folder is invalid.", "Output", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
             }
         }
 
-        foreach (ListViewItem listItem in listQueue.CheckedItems)
+        foreach (ListViewItem listItem in listQueue.Items)
         {
-            if (listItem.Tag is not QueueItem item)
+            if (listItem.Tag is not QueueItem item || !item.Render)
             {
                 continue;
             }
@@ -888,6 +1246,12 @@ public partial class MainForm : Form
             if (!item.IsAv1)
             {
                 continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(item.PresetName))
+            {
+                MessageBox.Show(this, "One or more items have no preset assigned.", "Preset", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
             }
 
             var targetKbps = TranscodeService.ResolveTargetBitrate(item.PresetSnapshot, item.ProbeInfo);
@@ -1040,15 +1404,35 @@ public partial class MainForm : Form
         labelFfmpegStatus.Text = ffmpegOk ? "FFmpeg: OK" : "FFmpeg: missing";
         labelFfmpegStatus.ForeColor = ffmpegOk ? Color.DarkGreen : Color.DarkRed;
 
-        var outputOk = checkSameAsSource.Checked || (!string.IsNullOrWhiteSpace(textOutputFolder.Text) && Directory.Exists(textOutputFolder.Text));
-        labelOutputStatus.Text = outputOk ? "Output: OK" : "Output: invalid";
-        labelOutputStatus.ForeColor = outputOk ? Color.DarkGreen : Color.DarkRed;
-
         var bitrateOk = true;
         var trimOk = true;
-        IEnumerable<ListViewItem> itemsToCheck = listQueue.CheckedItems.Count > 0
-            ? listQueue.CheckedItems.Cast<ListViewItem>()
+        var renderItems = listQueue.Items.Cast<ListViewItem>()
+            .Where(item => item.Tag is QueueItem queueItem && queueItem.Render)
+            .ToList();
+        IEnumerable<ListViewItem> itemsToCheck = renderItems.Count > 0
+            ? renderItems
             : listQueue.SelectedItems.Cast<ListViewItem>();
+        var outputOk = true;
+        if (checkSameAsSource.Checked)
+        {
+            outputOk = true;
+        }
+        else
+        {
+            var globalFolder = textOutputFolder.Text.Trim();
+            outputOk = itemsToCheck.All(listItem =>
+            {
+                if (listItem.Tag is not QueueItem item)
+                {
+                    return true;
+                }
+
+                var folder = string.IsNullOrWhiteSpace(item.OutputFolder) ? globalFolder : item.OutputFolder;
+                return !string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder);
+            });
+        }
+        labelOutputStatus.Text = outputOk ? "Output: OK" : "Output: invalid";
+        labelOutputStatus.ForeColor = outputOk ? Color.DarkGreen : Color.DarkRed;
 
         var hasItems = false;
         foreach (var listItem in itemsToCheck)
@@ -1087,10 +1471,67 @@ public partial class MainForm : Form
         btnStart.Enabled = ffmpegOk && outputOk && bitrateOk && trimOk && !_isProcessing;
     }
 
+    private void UpdateFfmpegDownloadStatus(string status)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => UpdateFfmpegDownloadStatus(status));
+            return;
+        }
+
+        labelFfmpegDownloadStatus.Text = status;
+    }
+
     private void UpdateTrimValidation()
     {
-        var invalid = checkEnableTrim.Checked && GetTrimStartTime() > GetTrimEndTime();
+        if (listQueue.SelectedItems.Count != 1)
+        {
+            trimPanel.BackColor = _trimPanelDefaultColor;
+            labelTrimError.Visible = false;
+            SetTrimTextBoxState(true, true);
+            return;
+        }
+
+        if (listQueue.SelectedItems[0].Tag is not QueueItem item || !item.TrimEnabled)
+        {
+            trimPanel.BackColor = _trimPanelDefaultColor;
+            labelTrimError.Visible = false;
+            SetTrimTextBoxState(true, true);
+            return;
+        }
+
+        var startValid = TryParseTrimTime(textTrimStart.Text, out var start);
+        var endValid = TryParseTrimTime(textTrimEnd.Text, out var end);
+        SetTrimTextBoxState(startValid, endValid);
+
+        var invalid = !startValid || !endValid;
+        var errorMessage = string.Empty;
+        if (invalid)
+        {
+            errorMessage = "Invalid time format";
+        }
+        else
+        {
+            var duration = item.Duration;
+            if (duration.HasValue && duration.Value > TimeSpan.Zero)
+            {
+                if (start > duration.Value || end > duration.Value)
+                {
+                    invalid = true;
+                    errorMessage = "Time exceeds duration";
+                }
+            }
+
+            if (!invalid && start >= end)
+            {
+                invalid = true;
+                errorMessage = "Start must be < End";
+            }
+        }
+
         trimPanel.BackColor = invalid ? Color.MistyRose : _trimPanelDefaultColor;
+        labelTrimError.Text = errorMessage;
+        labelTrimError.Visible = invalid;
     }
 
     private static bool IsTrimInvalid(QueueItem item)
@@ -1102,10 +1543,18 @@ public partial class MainForm : Form
 
         if (!TryParseTrimTime(item.TrimStart, out var start) || !TryParseTrimTime(item.TrimEnd, out var end))
         {
-            return false;
+            return true;
         }
 
-        return start > end;
+        if (item.Duration.HasValue && item.Duration.Value > TimeSpan.Zero)
+        {
+            if (start > item.Duration.Value || end > item.Duration.Value)
+            {
+                return true;
+            }
+        }
+
+        return start >= end;
     }
 
     private ProbeInfo? GetSelectedProbeInfo()
@@ -1113,39 +1562,157 @@ public partial class MainForm : Form
         return listQueue.SelectedItems.Count > 0 ? (listQueue.SelectedItems[0].Tag as QueueItem)?.ProbeInfo : null;
     }
 
-    private TimeSpan GetTrimStartTime()
+    private void SetTrimTextBoxState(bool startValid, bool endValid)
     {
-        return BuildTrimTime(numTrimStartHours, numTrimStartMinutes, numTrimStartSeconds, numTrimStartMilliseconds);
+        if (_isUpdatingSelection)
+        {
+            return;
+        }
+
+        textTrimStart.BackColor = startValid ? _trimTextBoxDefaultColor : Color.MistyRose;
+        textTrimEnd.BackColor = endValid ? _trimTextBoxDefaultColor : Color.MistyRose;
     }
 
-    private TimeSpan GetTrimEndTime()
+    private void UpdateTrimUiFromItem(QueueItem item)
     {
-        return BuildTrimTime(numTrimEndHours, numTrimEndMinutes, numTrimEndSeconds, numTrimEndMilliseconds);
+        var durationSeconds = Math.Max(0, item.Duration?.TotalSeconds ?? 0);
+        trimTimeline.DurationSeconds = durationSeconds;
+
+        var start = ParseTrimTime(item.TrimStart);
+        var end = ParseTrimTime(item.TrimEnd);
+        if (durationSeconds > 0 && end == TimeSpan.Zero && !item.TrimWasEditedByUser)
+        {
+            end = TimeSpan.FromSeconds(durationSeconds);
+            item.TrimEnd = FormatTrimTime(end);
+        }
+
+        _suppressTrimText = true;
+        textTrimStart.Text = FormatTrimTime(start);
+        textTrimEnd.Text = FormatTrimTime(end);
+        _suppressTrimText = false;
+
+        trimTimeline.StartSeconds = start.TotalSeconds;
+        trimTimeline.EndSeconds = end.TotalSeconds;
+        trimTimeline.Enabled = checkEnableTrim.Checked && durationSeconds > 0;
+
+        textTrimStart.BackColor = _trimTextBoxDefaultColor;
+        textTrimEnd.BackColor = _trimTextBoxDefaultColor;
+        labelTrimError.Visible = false;
+
+        if (durationSeconds <= 0)
+        {
+            labelTrimHint.Text = "Duration unavailable";
+            labelTrimHint.Visible = true;
+        }
+        else
+        {
+            labelTrimHint.Visible = false;
+        }
     }
 
-    private static TimeSpan BuildTrimTime(NumericUpDown hours, NumericUpDown minutes, NumericUpDown seconds, NumericUpDown milliseconds)
+    private void OnTrimTimelineChanged()
     {
-        var totalMilliseconds = (((int)hours.Value * 60 + (int)minutes.Value) * 60 + (int)seconds.Value) * 1000 + (int)milliseconds.Value;
-        return TimeSpan.FromMilliseconds(totalMilliseconds);
+        if (_isUpdatingSelection || listQueue.SelectedItems.Count != 1)
+        {
+            return;
+        }
+
+        if (listQueue.SelectedItems[0].Tag is not QueueItem item)
+        {
+            return;
+        }
+
+        if (!checkEnableTrim.Checked)
+        {
+            _isUpdatingSelection = true;
+            checkEnableTrim.Checked = true;
+            _isUpdatingSelection = false;
+        }
+
+        var start = TimeSpan.FromSeconds(trimTimeline.StartSeconds);
+        var end = TimeSpan.FromSeconds(trimTimeline.EndSeconds);
+
+        item.TrimEnabled = checkEnableTrim.Checked;
+        item.TrimStart = FormatTrimTime(start);
+        item.TrimEnd = FormatTrimTime(end);
+        item.TrimWasEditedByUser = true;
+
+        _suppressTrimText = true;
+        textTrimStart.Text = item.TrimStart;
+        textTrimEnd.Text = item.TrimEnd;
+        _suppressTrimText = false;
+
+        UpdateListViewItem(item, listQueue.SelectedItems[0]);
+        AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Trim updated: {item.FilePath} ({item.TrimStart}-{item.TrimEnd})" });
+        UpdateTrimValidation();
+        UpdateStatusIndicators();
     }
 
-    private void SetTrimStartControls(TimeSpan time)
+    private void OnTrimTextChanged()
     {
-        SetTrimControls(time, numTrimStartHours, numTrimStartMinutes, numTrimStartSeconds, numTrimStartMilliseconds);
-    }
+        if (_isUpdatingSelection || _suppressTrimText || listQueue.SelectedItems.Count != 1)
+        {
+            return;
+        }
 
-    private void SetTrimEndControls(TimeSpan time)
-    {
-        SetTrimControls(time, numTrimEndHours, numTrimEndMinutes, numTrimEndSeconds, numTrimEndMilliseconds);
-    }
+        if (listQueue.SelectedItems[0].Tag is not QueueItem item || !checkEnableTrim.Checked)
+        {
+            return;
+        }
 
-    private static void SetTrimControls(TimeSpan time, NumericUpDown hours, NumericUpDown minutes, NumericUpDown seconds, NumericUpDown milliseconds)
-    {
-        var totalHours = (int)Math.Clamp(time.TotalHours, 0, 99);
-        hours.Value = totalHours;
-        minutes.Value = time.Minutes;
-        seconds.Value = time.Seconds;
-        milliseconds.Value = time.Milliseconds;
+        var startValid = TryParseTrimTime(textTrimStart.Text, out var start);
+        var endValid = TryParseTrimTime(textTrimEnd.Text, out var end);
+        SetTrimTextBoxState(startValid, endValid);
+
+        if (!startValid || !endValid)
+        {
+            labelTrimError.Text = "Invalid time format";
+            labelTrimError.Visible = true;
+            UpdateTrimValidation();
+            return;
+        }
+
+        var durationSeconds = item.Duration?.TotalSeconds ?? 0;
+        if (durationSeconds > 0)
+        {
+            var duration = TimeSpan.FromSeconds(durationSeconds);
+            if (start > duration || end > duration)
+            {
+                labelTrimError.Text = "Time exceeds duration";
+                labelTrimError.Visible = true;
+                UpdateTrimValidation();
+                return;
+            }
+        }
+
+        if (start >= end)
+        {
+            labelTrimError.Text = "Start must be < End";
+            labelTrimError.Visible = true;
+            UpdateTrimValidation();
+            return;
+        }
+
+        labelTrimError.Visible = false;
+
+        item.TrimEnabled = true;
+        item.TrimStart = FormatTrimTime(start);
+        item.TrimEnd = FormatTrimTime(end);
+        item.TrimWasEditedByUser = true;
+
+        if (durationSeconds > 0)
+        {
+            _isUpdatingSelection = true;
+            trimTimeline.DurationSeconds = Math.Max(0, durationSeconds);
+            trimTimeline.StartSeconds = start.TotalSeconds;
+            trimTimeline.EndSeconds = end.TotalSeconds;
+            _isUpdatingSelection = false;
+        }
+
+        UpdateListViewItem(item, listQueue.SelectedItems[0]);
+        AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Trim updated: {item.FilePath} ({item.TrimStart}-{item.TrimEnd})" });
+        UpdateTrimValidation();
+        UpdateStatusIndicators();
     }
 
     private static TimeSpan ParseTrimTime(string? value)
@@ -1161,24 +1728,44 @@ public partial class MainForm : Form
             return false;
         }
 
-        var parts = value.Split(':');
-        if (parts.Length != 3)
+        var parts = value.Trim().Split(':');
+        if (parts.Length is < 1 or > 3)
         {
             return false;
         }
 
-        if (!int.TryParse(parts[0], out var hours) || hours < 0 || hours > 99)
+        var hours = 0;
+        var minutes = 0;
+        var secondsPart = string.Empty;
+
+        if (parts.Length == 1)
+        {
+            secondsPart = parts[0];
+        }
+        else if (parts.Length == 2)
+        {
+            if (!int.TryParse(parts[0], out minutes))
+            {
+                return false;
+            }
+            secondsPart = parts[1];
+        }
+        else
+        {
+            if (!int.TryParse(parts[0], out hours) || !int.TryParse(parts[1], out minutes))
+            {
+                return false;
+            }
+            secondsPart = parts[2];
+        }
+
+        if (hours < 0 || hours > 99 || minutes < 0 || minutes > 59)
         {
             return false;
         }
 
-        if (!int.TryParse(parts[1], out var minutes) || minutes < 0 || minutes > 59)
-        {
-            return false;
-        }
-
-        var secParts = parts[2].Split('.');
-        if (secParts.Length != 2)
+        var secParts = secondsPart.Split('.');
+        if (secParts.Length is < 1 or > 2)
         {
             return false;
         }
@@ -1188,20 +1775,20 @@ public partial class MainForm : Form
             return false;
         }
 
-        if (!int.TryParse(secParts[1], out var milliseconds) || milliseconds < 0 || milliseconds > 999)
+        var milliseconds = 0;
+        if (secParts.Length == 2 && (!int.TryParse(secParts[1], out milliseconds) || milliseconds < 0 || milliseconds > 999))
         {
             return false;
         }
 
-        var totalMilliseconds = (((hours * 60) + minutes) * 60 + seconds) * 1000 + milliseconds;
-        time = TimeSpan.FromMilliseconds(totalMilliseconds);
+        time = new TimeSpan(0, hours, minutes, seconds, milliseconds);
         return true;
     }
 
     private static string FormatTrimTime(TimeSpan time)
     {
         var totalHours = (int)Math.Clamp(time.TotalHours, 0, 99);
-        return $"{totalHours:00}:{time.Minutes:00}:{time.Seconds:00}.{time.Milliseconds:000}";
+        return $"{totalHours:00}:{time.Minutes:00}:{time.Seconds:00}";
     }
 
     private static string FormatDuration(double seconds)

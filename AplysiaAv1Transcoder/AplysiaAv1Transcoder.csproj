@@ -5,6 +5,7 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <RootNamespace>AplysiaAv1Transcoder</RootNamespace>
     <AssemblyName>AplysiaAv1Transcoder</AssemblyName>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>

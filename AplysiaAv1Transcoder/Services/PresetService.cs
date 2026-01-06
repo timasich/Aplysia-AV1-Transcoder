@@ -56,44 +56,44 @@ public sealed class PresetService
         {
             new()
             {
+                Id = Guid.NewGuid(),
                 Name = "H264 Safe",
                 TargetCodec = TargetCodec.H264,
                 BitrateMode = BitrateMode.MultiplierFromSource,
-                Multiplier = 2.0,
-                NvencPreset = "p5",
+                Multiplier = 1.6,
                 PixelFormat = "yuv420p",
                 AudioMode = AudioMode.Copy,
                 ForceDav1d = true
             },
             new()
             {
+                Id = Guid.NewGuid(),
                 Name = "H264 Balanced",
                 TargetCodec = TargetCodec.H264,
                 BitrateMode = BitrateMode.MultiplierFromSource,
-                Multiplier = 1.6,
-                NvencPreset = "p5",
+                Multiplier = 1.3,
                 PixelFormat = "yuv420p",
                 AudioMode = AudioMode.Copy,
                 ForceDav1d = true
             },
             new()
             {
+                Id = Guid.NewGuid(),
                 Name = "H265 Safe",
                 TargetCodec = TargetCodec.H265,
                 BitrateMode = BitrateMode.MultiplierFromSource,
-                Multiplier = 1.6,
-                NvencPreset = "p5",
+                Multiplier = 1.25,
                 PixelFormat = "yuv420p",
                 AudioMode = AudioMode.Copy,
                 ForceDav1d = true
             },
             new()
             {
+                Id = Guid.NewGuid(),
                 Name = "H265 Balanced",
                 TargetCodec = TargetCodec.H265,
                 BitrateMode = BitrateMode.MultiplierFromSource,
-                Multiplier = 1.3,
-                NvencPreset = "p5",
+                Multiplier = 1.05,
                 PixelFormat = "yuv420p",
                 AudioMode = AudioMode.Copy,
                 ForceDav1d = true
@@ -105,6 +105,11 @@ public sealed class PresetService
     {
         foreach (var preset in presets)
         {
+            if (preset.Id == Guid.Empty)
+            {
+                preset.Id = Guid.NewGuid();
+            }
+
             if (preset.BitrateMode == BitrateMode.MultiplierFromSource)
             {
                 if (preset.Multiplier <= 0)

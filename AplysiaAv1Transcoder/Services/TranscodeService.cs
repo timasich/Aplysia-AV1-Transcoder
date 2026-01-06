@@ -16,7 +16,7 @@ public sealed class TranscodeService
 {
     private bool _libDav1dWarned;
 
-    public TranscodeResult BuildCommand(QueueItem item, string ffmpegPath, EncoderCapabilities capabilities, string outputPath, Action<LogEntry>? log = null)
+    public TranscodeResult BuildCommand(QueueItem item, string ffmpegPath, EncoderCapabilities capabilities, string outputPath, EncoderPriority encoderPriority, int speedQuality, Action<LogEntry>? log = null)
     {
         var preset = item.PresetSnapshot;
         var bitrate = ResolveTargetBitrate(preset, item.ProbeInfo, log);
@@ -40,22 +40,33 @@ public sealed class TranscodeService
         args.Add("-i");
         args.Add(item.FilePath);
 
-        if (item.TrimEnabled)
+        if (item.TrimEnabled && TryParseTrimTime(item.TrimStart, out var trimStart) && TryParseTrimTime(item.TrimEnd, out var trimEnd))
         {
-            if (!string.IsNullOrWhiteSpace(item.TrimStart))
+            var applyTrim = trimStart < trimEnd;
+            var duration = item.Duration ?? (item.ProbeInfo?.DurationSeconds > 0 ? TimeSpan.FromSeconds(item.ProbeInfo.DurationSeconds) : (TimeSpan?)null);
+            if (applyTrim && duration.HasValue && duration.Value > TimeSpan.Zero)
             {
-                args.Add("-ss");
-                args.Add(item.TrimStart!);
+                var fullRange = trimStart == TimeSpan.Zero && Math.Abs((trimEnd - duration.Value).TotalSeconds) < 0.5;
+                applyTrim = !fullRange;
             }
 
-            if (!string.IsNullOrWhiteSpace(item.TrimEnd))
+            if (applyTrim)
             {
-                args.Add("-to");
-                args.Add(item.TrimEnd!);
+                if (trimStart > TimeSpan.Zero)
+                {
+                    args.Add("-ss");
+                    args.Add(item.TrimStart!);
+                }
+
+                if (trimEnd > TimeSpan.Zero)
+                {
+                    args.Add("-to");
+                    args.Add(item.TrimEnd!);
+                }
             }
         }
 
-        var resolved = ResolveEncoder(preset, capabilities, log);
+        var resolved = ResolveEncoder(preset.TargetCodec, encoderPriority, capabilities, log);
         args.Add("-c:v");
         args.Add(resolved.encoderName);
 
@@ -69,16 +80,7 @@ public sealed class TranscodeService
             args.Add($"{bitrate * 2}k");
         }
 
-        if (resolved.usesNvenc)
-        {
-            args.Add("-preset");
-            args.Add(preset.NvencPreset);
-        }
-        else if (resolved.usesCpu)
-        {
-            args.Add("-preset");
-            args.Add("medium");
-        }
+        AppendSpeedQualityArgs(args, resolved.kind, speedQuality);
 
         if (!string.IsNullOrWhiteSpace(preset.PixelFormat))
         {
@@ -105,9 +107,9 @@ public sealed class TranscodeService
         return new TranscodeResult { Success = true, CommandLine = commandLine, Arguments = args };
     }
 
-    public async Task<TranscodeResult> RunAsync(QueueItem item, string ffmpegPath, EncoderCapabilities capabilities, string outputPath, Action<LogEntry> log, CancellationToken cancellationToken)
+    public async Task<TranscodeResult> RunAsync(QueueItem item, string ffmpegPath, EncoderCapabilities capabilities, string outputPath, EncoderPriority encoderPriority, int speedQuality, Action<LogEntry> log, CancellationToken cancellationToken)
     {
-        var build = BuildCommand(item, ffmpegPath, capabilities, outputPath, log);
+        var build = BuildCommand(item, ffmpegPath, capabilities, outputPath, encoderPriority, speedQuality, log);
         build.Success = false;
 
         item.LastCommandLine = build.CommandLine;
@@ -182,30 +184,38 @@ public sealed class TranscodeService
         return build;
     }
 
-    private static (string encoderName, bool usesNvenc, bool usesCpu) ResolveEncoder(Preset preset, EncoderCapabilities capabilities, Action<LogEntry>? log)
+    private enum EncoderKind
     {
-        var codecSuffix = preset.TargetCodec == TargetCodec.H264 ? "h264" : "hevc";
+        Nvenc,
+        Qsv,
+        Amf,
+        Cpu
+    }
 
-        switch (preset.EncoderPriority)
+    private static (string encoderName, EncoderKind kind) ResolveEncoder(TargetCodec codec, EncoderPriority encoderPriority, EncoderCapabilities capabilities, Action<LogEntry>? log)
+    {
+        var codecSuffix = codec == TargetCodec.H264 ? "h264" : "hevc";
+
+        switch (encoderPriority)
         {
             case EncoderPriority.NVENC:
-                if (IsNvencAvailable(preset.TargetCodec, capabilities))
+                if (IsNvencAvailable(codec, capabilities))
                 {
-                    return ($"{codecSuffix}_nvenc", true, false);
+                    return ($"{codecSuffix}_nvenc", EncoderKind.Nvenc);
                 }
                 log?.Invoke(new LogEntry { Level = LogLevel.Warning, Message = "NVENC not available. Falling back to CPU." });
                 return ResolveCpu(codecSuffix);
             case EncoderPriority.QSV:
-                if (IsQsvAvailable(preset.TargetCodec, capabilities))
+                if (IsQsvAvailable(codec, capabilities))
                 {
-                    return ($"{codecSuffix}_qsv", false, false);
+                    return ($"{codecSuffix}_qsv", EncoderKind.Qsv);
                 }
                 log?.Invoke(new LogEntry { Level = LogLevel.Warning, Message = "Intel QSV not available. Falling back to CPU." });
                 return ResolveCpu(codecSuffix);
             case EncoderPriority.AMF:
-                if (IsAmfAvailable(preset.TargetCodec, capabilities))
+                if (IsAmfAvailable(codec, capabilities))
                 {
-                    return ($"{codecSuffix}_amf", false, false);
+                    return ($"{codecSuffix}_amf", EncoderKind.Amf);
                 }
                 log?.Invoke(new LogEntry { Level = LogLevel.Warning, Message = "AMD AMF not available. Falling back to CPU." });
                 return ResolveCpu(codecSuffix);
@@ -213,17 +223,17 @@ public sealed class TranscodeService
                 return ResolveCpu(codecSuffix);
             case EncoderPriority.AutoHW:
             default:
-                if (IsNvencAvailable(preset.TargetCodec, capabilities))
+                if (IsNvencAvailable(codec, capabilities))
                 {
-                    return ($"{codecSuffix}_nvenc", true, false);
+                    return ($"{codecSuffix}_nvenc", EncoderKind.Nvenc);
                 }
-                if (IsQsvAvailable(preset.TargetCodec, capabilities))
+                if (IsQsvAvailable(codec, capabilities))
                 {
-                    return ($"{codecSuffix}_qsv", false, false);
+                    return ($"{codecSuffix}_qsv", EncoderKind.Qsv);
                 }
-                if (IsAmfAvailable(preset.TargetCodec, capabilities))
+                if (IsAmfAvailable(codec, capabilities))
                 {
-                    return ($"{codecSuffix}_amf", false, false);
+                    return ($"{codecSuffix}_amf", EncoderKind.Amf);
                 }
                 return ResolveCpu(codecSuffix);
         }
@@ -290,10 +300,85 @@ public sealed class TranscodeService
         return 2500;
     }
 
-    private static (string encoderName, bool usesNvenc, bool usesCpu) ResolveCpu(string codecSuffix)
+    private static (string encoderName, EncoderKind kind) ResolveCpu(string codecSuffix)
     {
         var encoder = codecSuffix == "h264" ? "libx264" : "libx265";
-        return (encoder, false, true);
+        return (encoder, EncoderKind.Cpu);
+    }
+
+    private static void AppendSpeedQualityArgs(List<string> args, EncoderKind kind, int speedQuality)
+    {
+        var value = Math.Clamp(speedQuality, 1, 9);
+        switch (kind)
+        {
+            case EncoderKind.Nvenc:
+                args.Add("-preset");
+                args.Add($"p{value}");
+                break;
+            case EncoderKind.Amf:
+                args.Add("-quality");
+                args.Add(ResolveAmfQuality(value));
+                break;
+            case EncoderKind.Qsv:
+                args.Add("-preset");
+                args.Add(ResolveQsvPreset(value));
+                break;
+            case EncoderKind.Cpu:
+                args.Add("-preset");
+                args.Add(ResolveCpuPreset(value));
+                break;
+        }
+    }
+
+    private static string ResolveAmfQuality(int value)
+    {
+        if (value <= 3)
+        {
+            return "speed";
+        }
+
+        if (value <= 6)
+        {
+            return "balanced";
+        }
+
+        return "quality";
+    }
+
+    private static string ResolveQsvPreset(int value)
+    {
+        var presets = new[]
+        {
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+            "veryslow",
+            "veryslow"
+        };
+
+        return presets[value - 1];
+    }
+
+    private static string ResolveCpuPreset(int value)
+    {
+        var presets = new[]
+        {
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow"
+        };
+
+        return presets[value - 1];
     }
 
     private static bool IsNvencAvailable(TargetCodec codec, EncoderCapabilities capabilities)
@@ -336,5 +421,70 @@ public sealed class TranscodeService
         }
 
         return value;
+    }
+
+    private static bool TryParseTrimTime(string? value, out TimeSpan time)
+    {
+        time = TimeSpan.Zero;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var parts = value.Trim().Split(':');
+        if (parts.Length is < 1 or > 3)
+        {
+            return false;
+        }
+
+        var hours = 0;
+        var minutes = 0;
+        var secondsPart = string.Empty;
+
+        if (parts.Length == 1)
+        {
+            secondsPart = parts[0];
+        }
+        else if (parts.Length == 2)
+        {
+            if (!int.TryParse(parts[0], out minutes))
+            {
+                return false;
+            }
+            secondsPart = parts[1];
+        }
+        else
+        {
+            if (!int.TryParse(parts[0], out hours) || !int.TryParse(parts[1], out minutes))
+            {
+                return false;
+            }
+            secondsPart = parts[2];
+        }
+
+        if (hours < 0 || hours > 99 || minutes < 0 || minutes > 59)
+        {
+            return false;
+        }
+
+        var secParts = secondsPart.Split('.');
+        if (secParts.Length is < 1 or > 2)
+        {
+            return false;
+        }
+
+        if (!int.TryParse(secParts[0], out var seconds) || seconds < 0 || seconds > 59)
+        {
+            return false;
+        }
+
+        var milliseconds = 0;
+        if (secParts.Length == 2 && (!int.TryParse(secParts[1], out milliseconds) || milliseconds < 0 || milliseconds > 999))
+        {
+            return false;
+        }
+
+        time = new TimeSpan(0, hours, minutes, seconds, milliseconds);
+        return true;
     }
 }

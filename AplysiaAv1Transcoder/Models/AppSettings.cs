@@ -9,6 +9,9 @@ public sealed class AppSettings
     public List<string> RecentOutputFolders { get; set; } = new();
     public string? LastSelectedPreset { get; set; }
     public int? QueueSplitterDistance { get; set; }
+    public EncoderPriority EncoderPriority { get; set; } = EncoderPriority.AutoHW;
+    public int SpeedQuality { get; set; } = 5;
+    public bool UncheckAfterRender { get; set; }
 
     [JsonIgnore]
     public string? ResolvedFfmpegPath { get; set; }

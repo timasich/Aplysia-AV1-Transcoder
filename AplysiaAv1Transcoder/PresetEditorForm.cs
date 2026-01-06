@@ -19,11 +19,11 @@ public sealed class PresetEditorForm : Form
     private readonly FlowLayoutPanel _multiplierPanel;
     private readonly Label _multiplierHelpLabel;
     private readonly Label _multiplierPreviewLabel;
-    private readonly ComboBox _nvencPresetCombo;
     private readonly TextBox _pixelFormatTextBox;
     private readonly ComboBox _audioModeCombo;
     private readonly CheckBox _forceDav1dCheck;
     private readonly Func<ProbeInfo?>? _probeProvider;
+    private readonly Guid _presetId;
 
     public Preset? ResultPreset { get; private set; }
 
@@ -40,18 +40,19 @@ public sealed class PresetEditorForm : Form
         Width = 480;
         Height = 520;
         _probeProvider = probeProvider;
+        _presetId = preset.Id == Guid.Empty ? Guid.NewGuid() : preset.Id;
 
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 12,
+            RowCount = 11,
             Padding = new Padding(12)
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
-        for (var i = 0; i < 11; i++)
+        for (var i = 0; i < 10; i++)
         {
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         }
@@ -119,21 +120,11 @@ public sealed class PresetEditorForm : Form
         layout.SetColumnSpan(_multiplierPreviewLabel, 2);
         layout.Controls.Add(_multiplierPreviewLabel, 0, 6);
 
-        layout.Controls.Add(new Label { Text = "NVENC preset", AutoSize = true }, 0, 7);
-        _nvencPresetCombo = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
-        _nvencPresetCombo.Items.AddRange(new object[] { "p1", "p2", "p3", "p4", "p5", "p6", "p7" });
-        _nvencPresetCombo.SelectedItem = preset.NvencPreset;
-        if (_nvencPresetCombo.SelectedIndex < 0)
-        {
-            _nvencPresetCombo.SelectedItem = "p5";
-        }
-        layout.Controls.Add(_nvencPresetCombo, 1, 7);
-
-        layout.Controls.Add(new Label { Text = "Pixel format", AutoSize = true }, 0, 8);
+        layout.Controls.Add(new Label { Text = "Pixel format", AutoSize = true }, 0, 7);
         _pixelFormatTextBox = new TextBox { Dock = DockStyle.Fill, Text = preset.PixelFormat };
-        layout.Controls.Add(_pixelFormatTextBox, 1, 8);
+        layout.Controls.Add(_pixelFormatTextBox, 1, 7);
 
-        layout.Controls.Add(new Label { Text = "Audio mode", AutoSize = true }, 0, 9);
+        layout.Controls.Add(new Label { Text = "Audio mode", AutoSize = true }, 0, 8);
         _audioModeCombo = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
         _audioModeCombo.Items.AddRange(Enum.GetNames<AudioMode>());
         _audioModeCombo.SelectedItem = preset.AudioMode.ToString();
@@ -141,11 +132,11 @@ public sealed class PresetEditorForm : Form
         {
             _audioModeCombo.SelectedIndex = 0;
         }
-        layout.Controls.Add(_audioModeCombo, 1, 9);
+        layout.Controls.Add(_audioModeCombo, 1, 8);
 
         _forceDav1dCheck = new CheckBox { Text = "Force dav1d decoder", Checked = preset.ForceDav1d, AutoSize = true };
         layout.SetColumnSpan(_forceDav1dCheck, 2);
-        layout.Controls.Add(_forceDav1dCheck, 0, 10);
+        layout.Controls.Add(_forceDav1dCheck, 0, 9);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true };
         var okButton = new Button { Text = "OK", AutoSize = true };
@@ -155,7 +146,7 @@ public sealed class PresetEditorForm : Form
         buttons.Controls.Add(okButton);
         buttons.Controls.Add(cancelButton);
         layout.SetColumnSpan(buttons, 2);
-        layout.Controls.Add(buttons, 0, 11);
+        layout.Controls.Add(buttons, 0, 10);
 
         Controls.Add(layout);
 
@@ -175,12 +166,12 @@ public sealed class PresetEditorForm : Form
 
         ResultPreset = new Preset
         {
+            Id = _presetId,
             Name = name,
             TargetCodec = Enum.Parse<TargetCodec>(_codecCombo.SelectedItem!.ToString()!, true),
             BitrateMode = _bitrateModeCombo.SelectedIndex == 1 ? BitrateMode.MultiplierFromSource : BitrateMode.FixedKbps,
             BitrateKbps = (int)_bitrateUpDown.Value,
             Multiplier = GetMultiplierValue(),
-            NvencPreset = _nvencPresetCombo.SelectedItem?.ToString() ?? "p5",
             PixelFormat = _pixelFormatTextBox.Text.Trim(),
             AudioMode = Enum.Parse<AudioMode>(_audioModeCombo.SelectedItem!.ToString()!, true),
             ForceDav1d = _forceDav1dCheck.Checked
