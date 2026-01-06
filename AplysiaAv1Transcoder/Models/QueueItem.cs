@@ -10,8 +10,6 @@ public sealed class QueueItem
     public string? TrimEnd { get; set; }
     public string Status { get; set; } = "Queued";
     public ProbeInfo? ProbeInfo { get; set; }
-    public int? AutoMatchedBitrateKbps { get; set; }
-    public AutoMatchMode AutoMatchMode { get; set; } = AutoMatchMode.Balanced;
-    public int AutoMatchBias { get; set; } = 0;
+    public bool IsAv1 { get; set; } = true;
     public string? LastCommandLine { get; set; }
 }

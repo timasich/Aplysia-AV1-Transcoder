@@ -1,3 +1,4 @@
+using System;
 using System.Text.Json;
 using AplysiaAv1Transcoder.Models;
 
@@ -34,7 +35,7 @@ public sealed class PresetService
                 return GetDefaultPresets();
             }
 
-            return presets;
+            return NormalizePresets(presets);
         }
         catch
         {
@@ -44,9 +45,8 @@ public sealed class PresetService
 
     public void SavePresets(IEnumerable<Preset> presets)
     {
-        var toSave = presets.Where(p => !p.IsBuiltInAuto).ToList();
         Directory.CreateDirectory(_storage.DataFolder);
-        var json = JsonSerializer.Serialize(toSave, _jsonOptions);
+        var json = JsonSerializer.Serialize(presets, _jsonOptions);
         File.WriteAllText(_storage.GetPresetsPath(), json);
     }
 
@@ -56,10 +56,10 @@ public sealed class PresetService
         {
             new()
             {
-                Name = "H264 8 Mbps",
+                Name = "H264 Safe",
                 TargetCodec = TargetCodec.H264,
-                EncoderPriority = EncoderPriority.AutoHW,
-                BitrateKbps = 8000,
+                BitrateMode = BitrateMode.MultiplierFromSource,
+                Multiplier = 2.0,
                 NvencPreset = "p5",
                 PixelFormat = "yuv420p",
                 AudioMode = AudioMode.Copy,
@@ -67,10 +67,32 @@ public sealed class PresetService
             },
             new()
             {
-                Name = "H265 6 Mbps",
+                Name = "H264 Balanced",
+                TargetCodec = TargetCodec.H264,
+                BitrateMode = BitrateMode.MultiplierFromSource,
+                Multiplier = 1.6,
+                NvencPreset = "p5",
+                PixelFormat = "yuv420p",
+                AudioMode = AudioMode.Copy,
+                ForceDav1d = true
+            },
+            new()
+            {
+                Name = "H265 Safe",
                 TargetCodec = TargetCodec.H265,
-                EncoderPriority = EncoderPriority.AutoHW,
-                BitrateKbps = 6000,
+                BitrateMode = BitrateMode.MultiplierFromSource,
+                Multiplier = 1.6,
+                NvencPreset = "p5",
+                PixelFormat = "yuv420p",
+                AudioMode = AudioMode.Copy,
+                ForceDav1d = true
+            },
+            new()
+            {
+                Name = "H265 Balanced",
+                TargetCodec = TargetCodec.H265,
+                BitrateMode = BitrateMode.MultiplierFromSource,
+                Multiplier = 1.3,
                 NvencPreset = "p5",
                 PixelFormat = "yuv420p",
                 AudioMode = AudioMode.Copy,
@@ -79,34 +101,20 @@ public sealed class PresetService
         };
     }
 
-    public static List<Preset> GetBuiltInAutoPresets()
+    private static List<Preset> NormalizePresets(List<Preset> presets)
     {
-        return new List<Preset>
+        foreach (var preset in presets)
         {
-            new()
+            if (preset.BitrateMode == BitrateMode.MultiplierFromSource)
             {
-                Name = "Auto H264 (match)",
-                TargetCodec = TargetCodec.H264,
-                EncoderPriority = EncoderPriority.AutoHW,
-                BitrateKbps = 0,
-                NvencPreset = "p5",
-                PixelFormat = "yuv420p",
-                AudioMode = AudioMode.Copy,
-                ForceDav1d = true,
-                IsBuiltInAuto = true
-            },
-            new()
-            {
-                Name = "Auto H265 (match)",
-                TargetCodec = TargetCodec.H265,
-                EncoderPriority = EncoderPriority.AutoHW,
-                BitrateKbps = 0,
-                NvencPreset = "p5",
-                PixelFormat = "yuv420p",
-                AudioMode = AudioMode.Copy,
-                ForceDav1d = true,
-                IsBuiltInAuto = true
+                if (preset.Multiplier <= 0)
+                {
+                    preset.Multiplier = 1.0;
+                }
+                preset.Multiplier = Math.Clamp(preset.Multiplier, 1.0, 3.0);
             }
-        };
+        }
+
+        return presets;
     }
 }

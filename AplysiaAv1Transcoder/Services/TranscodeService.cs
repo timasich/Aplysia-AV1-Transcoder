@@ -19,7 +19,7 @@ public sealed class TranscodeService
     public TranscodeResult BuildCommand(QueueItem item, string ffmpegPath, EncoderCapabilities capabilities, string outputPath, Action<LogEntry>? log = null)
     {
         var preset = item.PresetSnapshot;
-        var bitrate = preset.BitrateKbps;
+        var bitrate = ResolveTargetBitrate(preset, item.ProbeInfo, log);
         var args = new List<string> { "-hide_banner", "-y" };
 
         if (preset.ForceDav1d && capabilities.HasLibDav1d)
@@ -227,6 +227,67 @@ public sealed class TranscodeService
                 }
                 return ResolveCpu(codecSuffix);
         }
+    }
+
+    public static int ResolveTargetBitrate(Preset preset, ProbeInfo? info, Action<LogEntry>? log = null)
+    {
+        if (preset.BitrateMode == BitrateMode.FixedKbps)
+        {
+            return preset.BitrateKbps;
+        }
+
+        var sourceKbps = info?.VideoBitrateKbps ?? 0;
+        var usedFallback = false;
+        if (sourceKbps <= 0)
+        {
+            sourceKbps = GetFallbackSourceKbps(info);
+            usedFallback = true;
+        }
+
+        var target = (int)Math.Round(sourceKbps * Math.Clamp(preset.Multiplier, 0.1, 10.0));
+        target = Math.Clamp(target, 500, 200000);
+
+        if (usedFallback)
+        {
+            log?.Invoke(new LogEntry
+            {
+                Level = LogLevel.Warning,
+                Message = $"Source bitrate unknown, using fallback target bitrate {target} kbps."
+            });
+        }
+
+        return target;
+    }
+
+    public static int GetFallbackSourceKbps(ProbeInfo? info)
+    {
+        if (info == null)
+        {
+            return 8000;
+        }
+
+        var maxDim = Math.Max(info.Width, info.Height);
+        if (maxDim >= 2160)
+        {
+            return 20000;
+        }
+
+        if (maxDim >= 1440)
+        {
+            return 12000;
+        }
+
+        if (maxDim >= 1080)
+        {
+            return 8000;
+        }
+
+        if (maxDim >= 720)
+        {
+            return 4500;
+        }
+
+        return 2500;
     }
 
     private static (string encoderName, bool usesNvenc, bool usesCpu) ResolveCpu(string codecSuffix)

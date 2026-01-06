@@ -6,6 +6,7 @@ public sealed class ProbeInfo
     public double Fps { get; set; }
     public int Width { get; set; }
     public int Height { get; set; }
+    public string? VideoCodec { get; set; }
     public int? VideoBitrateKbps { get; set; }
     public int? AudioBitrateKbps { get; set; }
     public int? OverallBitrateKbps { get; set; }

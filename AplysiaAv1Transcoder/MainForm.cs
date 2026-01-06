@@ -1,5 +1,4 @@
 using System.Drawing;
-using System.Globalization;
 using System.Text;
 using AplysiaAv1Transcoder.Models;
 using AplysiaAv1Transcoder.Services;
@@ -18,17 +17,18 @@ public partial class MainForm : Form
 
     private AppSettings _settings;
     private List<Preset> _userPresets;
-    private List<Preset> _builtInPresets;
     private readonly List<LogEntry> _logEntries = new();
 
     private CancellationTokenSource? _queueCts;
     private bool _isProcessing;
     private bool _isUpdatingSelection;
+    private Color _trimPanelDefaultColor;
 
     public MainForm()
     {
         InitializeComponent();
-        AutoMatchService.DebugValidateScale();
+
+        ConfigureQueueColumns();
 
         _storage = new StorageService();
         _settingsService = new SettingsService(_storage);
@@ -40,7 +40,7 @@ public partial class MainForm : Form
 
         _settings = _settingsService.Load();
         _userPresets = _presetService.LoadPresets();
-        _builtInPresets = PresetService.GetBuiltInAutoPresets();
+        _trimPanelDefaultColor = trimPanel.BackColor;
 
         WireEvents();
         InitializeUiFromSettings();
@@ -76,19 +76,15 @@ public partial class MainForm : Form
         btnDeletePreset.Click += (_, _) => DeletePreset();
         comboActivePreset.SelectedIndexChanged += (_, _) => OnActivePresetChanged();
 
-        checkAutoMatch.CheckedChanged += (_, _) =>
-        {
-            _settings.AutoMatchForNewFiles = checkAutoMatch.Checked;
-            UpdateAutoMatchUiState();
-            UpdateStatusIndicators();
-        };
-        comboAutoMode.SelectedIndexChanged += (_, _) => OnAutoMatchModeChanged();
-        trackAutoBias.ValueChanged += (_, _) => OnAutoMatchBiasChanged();
-        comboDefaultTarget.SelectedIndexChanged += (_, _) => SaveDefaultTarget();
-
         checkEnableTrim.CheckedChanged += (_, _) => ApplyTrimSettings();
-        textTrimStart.TextChanged += (_, _) => ApplyTrimSettings();
-        textTrimEnd.TextChanged += (_, _) => ApplyTrimSettings();
+        numTrimStartHours.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimStartMinutes.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimStartSeconds.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimStartMilliseconds.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimEndHours.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimEndMinutes.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimEndSeconds.ValueChanged += (_, _) => ApplyTrimSettings();
+        numTrimEndMilliseconds.ValueChanged += (_, _) => ApplyTrimSettings();
 
         checkSameAsSource.CheckedChanged += (_, _) => OnOutputModeChanged();
         textOutputFolder.TextChanged += (_, _) => OnOutputFolderChanged();
@@ -114,18 +110,7 @@ public partial class MainForm : Form
 
     private void InitializeUiFromSettings()
     {
-        comboDefaultTarget.Items.AddRange(new object[] { "H264", "H265" });
-        comboAutoMode.Items.AddRange(new object[] { "Balanced", "Safe" });
         comboPriority.Items.AddRange(new object[] { "Auto(HW)", "NVENC", "Intel QSV", "AMD AMF", "CPU" });
-
-        checkAutoMatch.Checked = _settings.AutoMatchForNewFiles;
-        comboAutoMode.SelectedItem = _settings.AutoMatchMode.ToString();
-        if (comboAutoMode.SelectedIndex < 0)
-        {
-            comboAutoMode.SelectedIndex = 0;
-        }
-        trackAutoBias.Value = Math.Clamp(_settings.AutoMatchBias, trackAutoBias.Minimum, trackAutoBias.Maximum);
-        comboDefaultTarget.SelectedItem = _settings.DefaultTargetCodec.ToString();
 
         checkSameAsSource.Checked = false;
         textOutputFolder.Text = _settings.LastOutputFolder ?? string.Empty;
@@ -140,23 +125,36 @@ public partial class MainForm : Form
         comboPriority.SelectedIndex = 0;
 
         UpdateTrimInputState();
-        UpdateAutoMatchUiState();
         UpdateStatusIndicators();
+    }
+
+    private void ConfigureQueueColumns()
+    {
+        if (listQueue.Columns.Count > 0)
+        {
+            return;
+        }
+
+        listQueue.Columns.Add("File", 420);
+        listQueue.Columns.Add("Preset", 140);
+        listQueue.Columns.Add("Trim", 120);
+        listQueue.Columns.Add("Output", 240);
+        listQueue.Columns.Add("Est. size", 90);
+        listQueue.Columns.Add("Status", 120);
     }
 
     private void LoadPresetsIntoUi()
     {
-        var allPresets = _builtInPresets.Concat(_userPresets).ToList();
         comboActivePreset.DisplayMember = "Name";
         comboActivePreset.Items.Clear();
-        foreach (var preset in allPresets)
+        foreach (var preset in _userPresets)
         {
             comboActivePreset.Items.Add(preset);
         }
 
         if (!string.IsNullOrWhiteSpace(_settings.LastSelectedPreset))
         {
-            var match = allPresets.FirstOrDefault(p => string.Equals(p.Name, _settings.LastSelectedPreset, StringComparison.OrdinalIgnoreCase));
+            var match = _userPresets.FirstOrDefault(p => string.Equals(p.Name, _settings.LastSelectedPreset, StringComparison.OrdinalIgnoreCase));
             if (match != null)
             {
                 comboActivePreset.SelectedItem = match;
@@ -228,39 +226,27 @@ public partial class MainForm : Form
         {
             var info = await _ffprobeService.ProbeAsync(_settings.ResolvedFfprobePath, item.FilePath, CancellationToken.None);
             item.ProbeInfo = info;
+            if (!string.IsNullOrWhiteSpace(info?.VideoCodec))
+            {
+                item.IsAv1 = string.Equals(info.VideoCodec, "av1", StringComparison.OrdinalIgnoreCase);
+            }
         }
 
-        Preset? preset;
-        if (checkAutoMatch.Checked)
-        {
-            var target = _settings.DefaultTargetCodec;
-            preset = _builtInPresets.FirstOrDefault(p => p.TargetCodec == target) ?? _builtInPresets.First();
-        }
-        else
-        {
-            preset = GetActivePreset();
-        }
+        var preset = GetActivePreset();
 
         if (preset == null)
         {
             return;
         }
 
-        ApplyPreset(item, preset, GetAutoMatchConfigFromSettings());
+        ApplyPreset(item, preset);
     }
 
-    private void ApplyPreset(QueueItem item, Preset preset, AutoMatchConfig autoMatch)
+    private void ApplyPreset(QueueItem item, Preset preset)
     {
         item.PresetName = preset.Name;
-        item.AutoMatchMode = autoMatch.Mode;
-        item.AutoMatchBias = autoMatch.Bias;
         var snapshot = preset.Clone();
-        if (preset.IsBuiltInAuto)
-        {
-            var result = ComputeAutoBitrate(item.ProbeInfo, preset.TargetCodec, autoMatch);
-            snapshot.BitrateKbps = result.TargetKbps;
-            item.AutoMatchedBitrateKbps = result.TargetKbps;
-        }
+        snapshot.EncoderPriority = ParsePriority(comboPriority.SelectedItem?.ToString()) ?? EncoderPriority.AutoHW;
         item.PresetSnapshot = snapshot;
     }
 
@@ -272,7 +258,6 @@ public partial class MainForm : Form
             return;
         }
 
-        var autoMatch = GetAutoMatchConfigFromUi();
         foreach (ListViewItem listItem in listQueue.SelectedItems)
         {
             if (listItem.Tag is not QueueItem item)
@@ -280,11 +265,10 @@ public partial class MainForm : Form
                 continue;
             }
 
-            ApplyPreset(item, preset, autoMatch);
+            ApplyPreset(item, preset);
             UpdateListViewItem(item, listItem);
         }
 
-        UpdateAutoMatchPreview();
         UpdateStatusIndicators();
     }
 
@@ -321,6 +305,21 @@ public partial class MainForm : Form
         }
 
         QueueItem? firstItem = null;
+        var trimStart = FormatTrimTime(GetTrimStartTime());
+        var trimEnd = FormatTrimTime(GetTrimEndTime());
+
+        if (checkEnableTrim.Checked && trimEnd == FormatTrimTime(TimeSpan.Zero))
+        {
+            var selectedItem = listQueue.SelectedItems.Count > 0 ? listQueue.SelectedItems[0].Tag as QueueItem : null;
+            if (selectedItem?.ProbeInfo?.DurationSeconds > 0)
+            {
+                trimEnd = FormatDuration(selectedItem.ProbeInfo.DurationSeconds);
+                _isUpdatingSelection = true;
+                SetTrimEndControls(ParseTrimTime(trimEnd));
+                _isUpdatingSelection = false;
+            }
+        }
+
         foreach (ListViewItem listItem in listQueue.SelectedItems)
         {
             if (listItem.Tag is not QueueItem item)
@@ -330,10 +329,10 @@ public partial class MainForm : Form
 
             firstItem ??= item;
             item.TrimEnabled = checkEnableTrim.Checked;
-            item.TrimStart = string.IsNullOrWhiteSpace(textTrimStart.Text) ? null : textTrimStart.Text.Trim();
-            item.TrimEnd = string.IsNullOrWhiteSpace(textTrimEnd.Text) ? null : textTrimEnd.Text.Trim();
+            item.TrimStart = trimStart;
+            item.TrimEnd = trimEnd;
 
-            if (item.TrimEnabled && string.IsNullOrWhiteSpace(item.TrimEnd) && item.ProbeInfo?.DurationSeconds > 0)
+            if (item.TrimEnabled && item.ProbeInfo?.DurationSeconds > 0 && string.IsNullOrWhiteSpace(item.TrimEnd))
             {
                 item.TrimEnd = FormatDuration(item.ProbeInfo.DurationSeconds);
             }
@@ -344,126 +343,28 @@ public partial class MainForm : Form
         if (firstItem != null && firstItem.TrimEnabled && !string.IsNullOrWhiteSpace(firstItem.TrimEnd))
         {
             _isUpdatingSelection = true;
-            textTrimEnd.Text = firstItem.TrimEnd;
+            SetTrimEndControls(ParseTrimTime(firstItem.TrimEnd));
             _isUpdatingSelection = false;
         }
 
         UpdateTrimInputState();
+        UpdateTrimValidation();
+        UpdateStatusIndicators();
     }
 
     private void UpdateTrimInputState()
     {
-        textTrimStart.Enabled = checkEnableTrim.Checked;
-        textTrimEnd.Enabled = checkEnableTrim.Checked;
+        var enabled = checkEnableTrim.Checked;
+        numTrimStartHours.Enabled = enabled;
+        numTrimStartMinutes.Enabled = enabled;
+        numTrimStartSeconds.Enabled = enabled;
+        numTrimStartMilliseconds.Enabled = enabled;
+        numTrimEndHours.Enabled = enabled;
+        numTrimEndMinutes.Enabled = enabled;
+        numTrimEndSeconds.Enabled = enabled;
+        numTrimEndMilliseconds.Enabled = enabled;
     }
 
-    private void OnAutoMatchModeChanged()
-    {
-        if (_isUpdatingSelection)
-        {
-            return;
-        }
-
-        var mode = ParseAutoMatchMode(comboAutoMode.SelectedItem?.ToString());
-        _settings.AutoMatchMode = mode;
-        var defaultBias = mode == AutoMatchMode.Balanced ? 0 : 100;
-        _isUpdatingSelection = true;
-        trackAutoBias.Value = defaultBias;
-        _isUpdatingSelection = false;
-        _settings.AutoMatchBias = trackAutoBias.Value;
-
-        ApplyAutoMatchConfigToSelected(new AutoMatchConfig(mode, trackAutoBias.Value));
-    }
-
-    private void OnAutoMatchBiasChanged()
-    {
-        if (_isUpdatingSelection)
-        {
-            return;
-        }
-
-        var autoMatch = GetAutoMatchConfigFromUi();
-        _settings.AutoMatchBias = autoMatch.Bias;
-        ApplyAutoMatchConfigToSelected(autoMatch);
-    }
-
-    private void UpdateAutoMatchUiState()
-    {
-        var enabled = checkAutoMatch.Checked;
-        comboAutoMode.Visible = enabled;
-        labelAutoMode.Visible = enabled;
-        trackAutoBias.Visible = enabled;
-        labelAutoBias.Visible = enabled;
-        labelAutoPreview.Visible = enabled;
-        UpdateAutoMatchPreview();
-    }
-
-    private AutoMatchConfig GetAutoMatchConfigFromSettings()
-    {
-        return new AutoMatchConfig(_settings.AutoMatchMode, _settings.AutoMatchBias);
-    }
-
-    private AutoMatchConfig GetAutoMatchConfigFromUi()
-    {
-        var mode = ParseAutoMatchMode(comboAutoMode.SelectedItem?.ToString());
-        var bias = Math.Clamp(trackAutoBias.Value, trackAutoBias.Minimum, trackAutoBias.Maximum);
-        return new AutoMatchConfig(mode, bias);
-    }
-
-    private void ApplyAutoMatchConfigToSelected(AutoMatchConfig autoMatch)
-    {
-        foreach (ListViewItem listItem in listQueue.SelectedItems)
-        {
-            if (listItem.Tag is not QueueItem item)
-            {
-                continue;
-            }
-
-            item.AutoMatchMode = autoMatch.Mode;
-            item.AutoMatchBias = autoMatch.Bias;
-
-            if (item.PresetSnapshot.IsBuiltInAuto)
-            {
-                var result = ComputeAutoBitrate(item.ProbeInfo, item.PresetSnapshot.TargetCodec, autoMatch);
-                item.PresetSnapshot.BitrateKbps = result.TargetKbps;
-                item.AutoMatchedBitrateKbps = result.TargetKbps;
-                UpdateListViewItem(item, listItem);
-            }
-        }
-
-        UpdateAutoMatchPreview();
-        UpdateStatusIndicators();
-    }
-
-    private void UpdateAutoMatchPreview()
-    {
-        if (!checkAutoMatch.Checked)
-        {
-            labelAutoPreview.Text = string.Empty;
-            return;
-        }
-
-        var item = listQueue.SelectedItems.Count > 0 ? listQueue.SelectedItems[0].Tag as QueueItem : null;
-        if (item?.ProbeInfo == null)
-        {
-            labelAutoPreview.Text = "Estimated target bitrate: --";
-            return;
-        }
-
-        var autoMatch = new AutoMatchConfig(item.AutoMatchMode, item.AutoMatchBias);
-        var result = ComputeAutoBitrate(item.ProbeInfo, item.PresetSnapshot.TargetCodec, autoMatch);
-        if (result.TargetKbps <= 0 || result.SourceKbps <= 0)
-        {
-            labelAutoPreview.Text = "Estimated target bitrate: --";
-            return;
-        }
-
-        var targetMbps = result.TargetKbps / 1000.0;
-        var sourceMbps = result.SourceKbps / 1000.0;
-        labelAutoPreview.Text = string.Format(CultureInfo.InvariantCulture,
-            "Estimated target bitrate: {0:0.0} Mbps (from source {1:0.0} Mbps, scale {2:0.00})",
-            targetMbps, sourceMbps, result.Scale);
-    }
 
     private void UpdateSelectionUi()
     {
@@ -471,14 +372,12 @@ public partial class MainForm : Form
         {
             _isUpdatingSelection = true;
             checkEnableTrim.Checked = false;
-            textTrimStart.Text = string.Empty;
-            textTrimEnd.Text = string.Empty;
             comboPriority.SelectedIndex = 0;
-            comboAutoMode.SelectedItem = _settings.AutoMatchMode.ToString();
-            trackAutoBias.Value = Math.Clamp(_settings.AutoMatchBias, trackAutoBias.Minimum, trackAutoBias.Maximum);
+            SetTrimStartControls(TimeSpan.Zero);
+            SetTrimEndControls(TimeSpan.Zero);
             _isUpdatingSelection = false;
             UpdateTrimInputState();
-            UpdateAutoMatchPreview();
+            UpdateTrimValidation();
             UpdateStatusIndicators();
             return;
         }
@@ -490,15 +389,17 @@ public partial class MainForm : Form
 
         _isUpdatingSelection = true;
         checkEnableTrim.Checked = item.TrimEnabled;
-        textTrimStart.Text = item.TrimStart ?? string.Empty;
-        textTrimEnd.Text = item.TrimEnd ?? string.Empty;
+        SetTrimStartControls(ParseTrimTime(item.TrimStart));
+        if (item.TrimEnabled && string.IsNullOrWhiteSpace(item.TrimEnd) && item.ProbeInfo?.DurationSeconds > 0)
+        {
+            item.TrimEnd = FormatDuration(item.ProbeInfo.DurationSeconds);
+        }
+        SetTrimEndControls(ParseTrimTime(item.TrimEnd));
         comboPriority.SelectedItem = PriorityLabel(item.PresetSnapshot.EncoderPriority);
-        comboAutoMode.SelectedItem = item.AutoMatchMode.ToString();
-        trackAutoBias.Value = Math.Clamp(item.AutoMatchBias, trackAutoBias.Minimum, trackAutoBias.Maximum);
         _isUpdatingSelection = false;
 
         UpdateTrimInputState();
-        UpdateAutoMatchPreview();
+        UpdateTrimValidation();
         UpdateStatusIndicators();
     }
 
@@ -507,12 +408,6 @@ public partial class MainForm : Form
         if (comboActivePreset.SelectedItem is Preset preset)
         {
             _settings.LastSelectedPreset = preset.Name;
-            if (listQueue.SelectedItems.Count == 0)
-            {
-                _isUpdatingSelection = true;
-                comboPriority.SelectedItem = PriorityLabel(preset.EncoderPriority);
-                _isUpdatingSelection = false;
-            }
         }
 
         UpdatePresetButtons();
@@ -529,15 +424,15 @@ public partial class MainForm : Form
             return;
         }
 
-        btnEditPreset.Enabled = !preset.IsBuiltInAuto;
-        btnDeletePreset.Enabled = !preset.IsBuiltInAuto;
+        btnEditPreset.Enabled = true;
+        btnDeletePreset.Enabled = true;
         btnDuplicatePreset.Enabled = true;
     }
 
     private void CreatePreset()
     {
         var preset = new Preset { Name = "New Preset" };
-        using var dialog = new PresetEditorForm(preset, "New Preset");
+        using var dialog = new PresetEditorForm(preset, "New Preset", GetSelectedProbeInfo);
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.ResultPreset == null)
         {
             return;
@@ -550,12 +445,12 @@ public partial class MainForm : Form
 
     private void EditPreset()
     {
-        if (comboActivePreset.SelectedItem is not Preset preset || preset.IsBuiltInAuto)
+        if (comboActivePreset.SelectedItem is not Preset preset)
         {
             return;
         }
 
-        using var dialog = new PresetEditorForm(preset.Clone(), "Edit Preset");
+        using var dialog = new PresetEditorForm(preset.Clone(), "Edit Preset", GetSelectedProbeInfo);
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.ResultPreset == null)
         {
             return;
@@ -578,7 +473,7 @@ public partial class MainForm : Form
         }
 
         var copy = preset.Clone($"{preset.Name} Copy");
-        using var dialog = new PresetEditorForm(copy, "Duplicate Preset");
+        using var dialog = new PresetEditorForm(copy, "Duplicate Preset", GetSelectedProbeInfo);
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.ResultPreset == null)
         {
             return;
@@ -591,7 +486,7 @@ public partial class MainForm : Form
 
     private void DeletePreset()
     {
-        if (comboActivePreset.SelectedItem is not Preset preset || preset.IsBuiltInAuto)
+        if (comboActivePreset.SelectedItem is not Preset preset)
         {
             return;
         }
@@ -610,16 +505,6 @@ public partial class MainForm : Form
     private void SavePresets()
     {
         _presetService.SavePresets(_userPresets);
-    }
-
-    private void SaveDefaultTarget()
-    {
-        if (comboDefaultTarget.SelectedItem == null)
-        {
-            return;
-        }
-
-        _settings.DefaultTargetCodec = Enum.Parse<TargetCodec>(comboDefaultTarget.SelectedItem.ToString()!, true);
     }
 
     private void OnOutputModeChanged()
@@ -706,7 +591,7 @@ public partial class MainForm : Form
     private void UpdateListViewItem(QueueItem item, ListViewItem listItem)
     {
         EnsureListViewSubItems(listItem);
-        listItem.Text = item.FilePath;
+        listItem.Text = item.IsAv1 ? item.FilePath : $"[NOT AV1] {item.FilePath}";
         listItem.SubItems[1].Text = item.PresetName;
         listItem.SubItems[2].Text = item.TrimEnabled
             ? $"{item.TrimStart ?? ""}-{item.TrimEnd ?? ""}".Trim('-')
@@ -714,16 +599,23 @@ public partial class MainForm : Form
         listItem.SubItems[3].Text = GetOutputPath(item);
         listItem.SubItems[4].Text = FormatEstimatedSize(item);
         listItem.SubItems[5].Text = item.Status;
+        listItem.ForeColor = item.IsAv1 ? listQueue.ForeColor : Color.Red;
     }
 
     private string FormatEstimatedSize(QueueItem item)
     {
-        if (item.ProbeInfo == null || item.PresetSnapshot.BitrateKbps <= 0)
+        if (item.ProbeInfo == null || !item.IsAv1)
         {
             return string.Empty;
         }
 
-        var sizeKb = item.ProbeInfo.DurationSeconds * (item.PresetSnapshot.BitrateKbps / 8.0);
+        var targetKbps = TranscodeService.ResolveTargetBitrate(item.PresetSnapshot, item.ProbeInfo);
+        if (targetKbps <= 0)
+        {
+            return string.Empty;
+        }
+
+        var sizeKb = item.ProbeInfo.DurationSeconds * (targetKbps / 8.0);
         if (sizeKb <= 0)
         {
             return string.Empty;
@@ -904,6 +796,14 @@ public partial class MainForm : Form
                 continue;
             }
 
+            if (!item.IsAv1)
+            {
+                item.Status = "Skipped (not AV1)";
+                UpdateItemStatus(item);
+                AddLog(new LogEntry { Level = LogLevel.Info, Message = $"Skipped (not AV1): {item.FilePath}" });
+                continue;
+            }
+
             item.Status = "Running";
             UpdateItemStatus(item);
 
@@ -985,9 +885,21 @@ public partial class MainForm : Form
                 continue;
             }
 
-            if (item.PresetSnapshot.BitrateKbps <= 0)
+            if (!item.IsAv1)
+            {
+                continue;
+            }
+
+            var targetKbps = TranscodeService.ResolveTargetBitrate(item.PresetSnapshot, item.ProbeInfo);
+            if (targetKbps <= 0)
             {
                 MessageBox.Show(this, "One or more items have an invalid bitrate.", "Bitrate", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            if (IsTrimInvalid(item))
+            {
+                MessageBox.Show(this, "One or more items have an invalid trim range.", "Trim", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
         }
@@ -1065,12 +977,13 @@ public partial class MainForm : Form
         builder.AppendLine("AplysiaAv1Transcoder diagnostics");
         builder.AppendLine($"Data folder: {_storage.DataFolder}");
         builder.AppendLine($"FFmpeg: {_settings.ResolvedFfmpegPath}");
-        builder.AppendLine($"Auto match: {_settings.AutoMatchForNewFiles}");
-        builder.AppendLine($"Default target: {_settings.DefaultTargetCodec}");
         builder.AppendLine("Presets:");
         foreach (var preset in _userPresets)
         {
-            builder.AppendLine($"- {preset.Name} ({preset.TargetCodec}, {preset.BitrateKbps} kbps)");
+            var bitrateLabel = preset.BitrateMode == BitrateMode.FixedKbps
+                ? $"{preset.BitrateKbps} kbps"
+                : $"x{preset.Multiplier:0.00}";
+            builder.AppendLine($"- {preset.Name} ({preset.TargetCodec}, {bitrateLabel})");
         }
         builder.AppendLine();
         builder.AppendLine("Logs:");
@@ -1091,9 +1004,6 @@ public partial class MainForm : Form
     private void SaveState()
     {
         _settings.LastOutputFolder = textOutputFolder.Text.Trim();
-        _settings.AutoMatchForNewFiles = checkAutoMatch.Checked;
-        _settings.AutoMatchMode = ParseAutoMatchMode(comboAutoMode.SelectedItem?.ToString());
-        _settings.AutoMatchBias = trackAutoBias.Value;
         SaveSplitterDistance();
         _settingsService.Save(_settings);
         SavePresets();
@@ -1135,6 +1045,7 @@ public partial class MainForm : Form
         labelOutputStatus.ForeColor = outputOk ? Color.DarkGreen : Color.DarkRed;
 
         var bitrateOk = true;
+        var trimOk = true;
         IEnumerable<ListViewItem> itemsToCheck = listQueue.CheckedItems.Count > 0
             ? listQueue.CheckedItems.Cast<ListViewItem>()
             : listQueue.SelectedItems.Cast<ListViewItem>();
@@ -1143,42 +1054,159 @@ public partial class MainForm : Form
         foreach (var listItem in itemsToCheck)
         {
             hasItems = true;
-            if (listItem.Tag is QueueItem item && item.PresetSnapshot.BitrateKbps <= 0)
+            if (listItem.Tag is not QueueItem item)
             {
-                bitrateOk = false;
-                break;
+                continue;
+            }
+
+            if (item.IsAv1)
+            {
+                var targetKbps = TranscodeService.ResolveTargetBitrate(item.PresetSnapshot, item.ProbeInfo);
+                if (targetKbps <= 0)
+                {
+                    bitrateOk = false;
+                }
+            }
+
+            if (item.IsAv1 && IsTrimInvalid(item))
+            {
+                trimOk = false;
             }
         }
 
         if (!hasItems && GetActivePreset() is Preset active)
         {
-            bitrateOk = active.IsBuiltInAuto || active.BitrateKbps > 0;
+            bitrateOk = active.BitrateMode != BitrateMode.FixedKbps || active.BitrateKbps > 0;
         }
 
         labelBitrateStatus.Text = bitrateOk ? "Bitrate: OK" : "Bitrate: missing";
         labelBitrateStatus.ForeColor = bitrateOk ? Color.DarkGreen : Color.DarkRed;
+        labelTrimStatus.Text = trimOk ? "Trim: OK" : "Trim: invalid";
+        labelTrimStatus.ForeColor = trimOk ? Color.DarkGreen : Color.DarkRed;
 
-        btnStart.Enabled = ffmpegOk && outputOk && bitrateOk && !_isProcessing;
+        btnStart.Enabled = ffmpegOk && outputOk && bitrateOk && trimOk && !_isProcessing;
+    }
+
+    private void UpdateTrimValidation()
+    {
+        var invalid = checkEnableTrim.Checked && GetTrimStartTime() > GetTrimEndTime();
+        trimPanel.BackColor = invalid ? Color.MistyRose : _trimPanelDefaultColor;
+    }
+
+    private static bool IsTrimInvalid(QueueItem item)
+    {
+        if (!item.TrimEnabled)
+        {
+            return false;
+        }
+
+        if (!TryParseTrimTime(item.TrimStart, out var start) || !TryParseTrimTime(item.TrimEnd, out var end))
+        {
+            return false;
+        }
+
+        return start > end;
+    }
+
+    private ProbeInfo? GetSelectedProbeInfo()
+    {
+        return listQueue.SelectedItems.Count > 0 ? (listQueue.SelectedItems[0].Tag as QueueItem)?.ProbeInfo : null;
+    }
+
+    private TimeSpan GetTrimStartTime()
+    {
+        return BuildTrimTime(numTrimStartHours, numTrimStartMinutes, numTrimStartSeconds, numTrimStartMilliseconds);
+    }
+
+    private TimeSpan GetTrimEndTime()
+    {
+        return BuildTrimTime(numTrimEndHours, numTrimEndMinutes, numTrimEndSeconds, numTrimEndMilliseconds);
+    }
+
+    private static TimeSpan BuildTrimTime(NumericUpDown hours, NumericUpDown minutes, NumericUpDown seconds, NumericUpDown milliseconds)
+    {
+        var totalMilliseconds = (((int)hours.Value * 60 + (int)minutes.Value) * 60 + (int)seconds.Value) * 1000 + (int)milliseconds.Value;
+        return TimeSpan.FromMilliseconds(totalMilliseconds);
+    }
+
+    private void SetTrimStartControls(TimeSpan time)
+    {
+        SetTrimControls(time, numTrimStartHours, numTrimStartMinutes, numTrimStartSeconds, numTrimStartMilliseconds);
+    }
+
+    private void SetTrimEndControls(TimeSpan time)
+    {
+        SetTrimControls(time, numTrimEndHours, numTrimEndMinutes, numTrimEndSeconds, numTrimEndMilliseconds);
+    }
+
+    private static void SetTrimControls(TimeSpan time, NumericUpDown hours, NumericUpDown minutes, NumericUpDown seconds, NumericUpDown milliseconds)
+    {
+        var totalHours = (int)Math.Clamp(time.TotalHours, 0, 99);
+        hours.Value = totalHours;
+        minutes.Value = time.Minutes;
+        seconds.Value = time.Seconds;
+        milliseconds.Value = time.Milliseconds;
+    }
+
+    private static TimeSpan ParseTrimTime(string? value)
+    {
+        return TryParseTrimTime(value, out var time) ? time : TimeSpan.Zero;
+    }
+
+    private static bool TryParseTrimTime(string? value, out TimeSpan time)
+    {
+        time = TimeSpan.Zero;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var parts = value.Split(':');
+        if (parts.Length != 3)
+        {
+            return false;
+        }
+
+        if (!int.TryParse(parts[0], out var hours) || hours < 0 || hours > 99)
+        {
+            return false;
+        }
+
+        if (!int.TryParse(parts[1], out var minutes) || minutes < 0 || minutes > 59)
+        {
+            return false;
+        }
+
+        var secParts = parts[2].Split('.');
+        if (secParts.Length != 2)
+        {
+            return false;
+        }
+
+        if (!int.TryParse(secParts[0], out var seconds) || seconds < 0 || seconds > 59)
+        {
+            return false;
+        }
+
+        if (!int.TryParse(secParts[1], out var milliseconds) || milliseconds < 0 || milliseconds > 999)
+        {
+            return false;
+        }
+
+        var totalMilliseconds = (((hours * 60) + minutes) * 60 + seconds) * 1000 + milliseconds;
+        time = TimeSpan.FromMilliseconds(totalMilliseconds);
+        return true;
+    }
+
+    private static string FormatTrimTime(TimeSpan time)
+    {
+        var totalHours = (int)Math.Clamp(time.TotalHours, 0, 99);
+        return $"{totalHours:00}:{time.Minutes:00}:{time.Seconds:00}.{time.Milliseconds:000}";
     }
 
     private static string FormatDuration(double seconds)
     {
-        return TimeSpan.FromSeconds(seconds).ToString(@"hh\:mm\:ss\.fff");
-    }
-
-    private static AutoMatchResult ComputeAutoBitrate(ProbeInfo? info, TargetCodec target, AutoMatchConfig autoMatch)
-    {
-        if (info == null)
-        {
-            return new AutoMatchResult(0, 0, 1);
-        }
-
-        return AutoMatchService.ComputeAutoTarget(info, target, autoMatch);
-    }
-
-    private static AutoMatchMode ParseAutoMatchMode(string? text)
-    {
-        return Enum.TryParse(text, true, out AutoMatchMode mode) ? mode : AutoMatchMode.Balanced;
+        return FormatTrimTime(TimeSpan.FromSeconds(seconds));
     }
 
     private static EncoderPriority? ParsePriority(string? text)

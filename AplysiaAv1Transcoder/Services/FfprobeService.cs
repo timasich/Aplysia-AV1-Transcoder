@@ -85,6 +85,11 @@ public sealed class FfprobeService
                 var codecType = typeElement.GetString();
                 if (string.Equals(codecType, "video", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (stream.TryGetProperty("codec_name", out var codecElement))
+                    {
+                        info.VideoCodec = codecElement.GetString();
+                    }
+
                     if (stream.TryGetProperty("width", out var widthElement))
                     {
                         info.Width = widthElement.GetInt32();
