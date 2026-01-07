@@ -11,14 +11,13 @@ The app requires `ffmpeg.exe` and `ffprobe.exe`.
   - `ffmpeg\bin\ffmpeg.exe` relative to the app folder (portable)
   - Any folder of your choice, then set the path via the **FFmpeg...** button in the Queue tab.
 
-## Presets and auto-match
+## Presets
 
 - Presets only contain encoding settings (codec, bitrate, encoder priority, pixel format, audio mode, dav1d toggle). Trim is per-file and not stored in presets.
-- Two built-in presets are always available:
-  - **Auto H264 (match)**
-  - **Auto H265 (match)**
-- When **Auto match for new files** is enabled, ffprobe is used on add. The app computes a target bitrate and assigns the matching Auto preset based on the default target codec.
-- Estimated size is shown per item as `duration * (bitrate / 8)` in KB.
+- Four built-in presets are always available:
+  - **H264 Safe (x1.6 Bitrate) & H264 Balance (x1.3 Bitrate)**
+  - **H265 Safe (x1.25 Bitrate) & H265 Balance (x1.05 Bitrate)**
+- You can create new presets and change them.
 
 ## Settings and files
 
